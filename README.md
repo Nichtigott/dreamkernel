@@ -12,6 +12,19 @@ declarations — area shapes (topologies), projection maps, and cell models — 
 
 ---
 
+## Contents
+
+- [Quick start](#declare--build--run) (three areas, running)
+- [**Usage (complete)**](#usage-complete): field tables / **how to configure an area's topology** / slots & sub-regions / projections / cell templates / assembly / readout / validation errors / delay formula
+  - [How to configure a topology](#2-how-to-configure-an-areas-topology-the-easy-place-to-get-wrong) ← **the easy place to get wrong**
+- [One `Cell` template → a population](#one-cell-template--a-population-with-individual-differences)
+- [Neuromodulators](#neuromodulators-are-named-not-a-single-arousal-scalar)
+- [Assembly](#assembly-a-brain-is-put-together-from-parts)
+- [How similar frameworks do it](#how-similar-frameworks-do-it)
+- [Design principles](#design-principles)
+
+---
+
 ## Three ideas
 
 | Idea | What it means |
@@ -32,6 +45,7 @@ Treating it as metric fabricates a delay out of nothing. Hence three tiers inste
 ## Declare → build → run
 
 ```rust
+use dreamkernel::core::cell::Modulators;
 use dreamkernel::sim::{Brain, Config};
 
 // ... declare SRC / MID / OUT (see examples/minimal.rs) ...
@@ -40,7 +54,7 @@ let mut brain = Brain::declare(&[SRC, MID, OUT], Config::default())?; // declara
 brain.wire_local();                                                  // local recurrence
 let mut ext = vec![0.0; brain.areas.len()];
 ext[0] = 1.2;                                                        // drive the first area only
-for _ in 0..300 { brain.step(&ext, 1.0); }
+for _ in 0..300 { brain.step(&ext, &Modulators::default()); }
 println!("{} Hz", brain.rate_hz(0));
 ```
 
@@ -91,6 +105,196 @@ const MID: AreaSpec = AreaSpec {
 `Model::Rate` is a **modelling choice, not a biological fact**: a real neuron does not emit
 "probabilistic spikes". It exists so ANN-style units can be plugged into the same engine
 for comparison, and therefore has to be declared explicitly.
+
+---
+
+## Usage (complete)
+
+From "runs in five minutes" to "configure the topology correctly", step by step.
+
+### 0. Five minutes
+
+```rust
+use dreamkernel::sim::{Brain, Config};
+use dreamkernel::core::cell::Modulators;
+
+let mut brain = Brain::declare(&[SRC, MID], Config::default())?;   // declaration → brain
+brain.wire_local();                                               // local recurrence
+let ext = vec![1.2, 0.0];                                         // per-area drive
+for _ in 0..300 { brain.step(&ext, &Modulators::default()); }
+println!("SRC {} Hz", brain.rate_hz(0));
+```
+
+### 1. Fields of an area (`AreaSpec`)
+
+| Field | Required | Meaning |
+|---|---|---|
+| `name` | ✓ | unique area name (instance-prefixed when assembled) |
+| `class` | ✓ | `Cortex` / `ThalamicRelay{tonic}` / `SubcorticalRelay` / `PrimaryAfferent` / `Subcortical` / `Modulatory` / `Motor` — drives weight tier, background, homeostasis |
+| `topo` | ✓ | modality label: `Visual` / `Somatic` / `Auditory` / `None` (only used to check who should be topographic with whom) |
+| `micro` | ✓ | `Micro::cortical()/relay()/agranular()`: lamination + inhibitory fraction |
+| `size` | ✓ | `Size::new(E, I, patches)` — **only `patches` is used**; E/I come from `Config` |
+| `layout` | ✓ | `Layout::mni([x,y,z], width)`: centre and scale (width sets the half-extent used for distances) |
+| `motif` | ✓ | local recurrence / feedforward / feedback strength |
+| `slots` | ✓ | ports (see §3) |
+| `topology` | ✓ | **the shape of the area** (see §2) |
+| `efferents` | ✓ | outgoing projections (see §4); `&[]` = none |
+| `neuron` | ✓ | cell template (see §5) |
+| `type_specs` | ✓ | per-type templates `[P,PV,SOM,VIP]`; `&[]` = all four use `neuron` |
+
+### 2. **How to configure an area's topology** (the easy place to get wrong)
+
+A topology decides three things: (1) each neuron's coordinate on the "map"; (2) the index
+order (`assign(n)` returns coordinates in index order, so index ↔ coordinate always agree);
+(3) **whether coordinates may be read as distance** (`metric`, hence conduction delay).
+
+| What you want to express | Write | `dims()` | `metric` | Behaviour |
+|---|---|---|---|---|
+| no space (modulatory / reticular nuclei) | `Topo::POINT` | 0 | `None` | every neuron at one point; no distance at all |
+| one **ordered axis** (tonotopy, 1-D body map) | `Topo::LINE` | 1 | `Millimetres` | `u=(i+0.5)/n`; coordinates are millimetres |
+| a **periodic** quantity (orientation 0°/180°, head direction) | `Topo::RING` | 1 | `Millimetres` | like `LINE` but `u` wraps (0 and 1 are neighbours) |
+| a **2-D sheet** (retinotopy, 2-D body map) | `Topo::GRID` | 2 | `Millimetres` | `n` is laid out as a near-square grid |
+| `n` **discrete modules** (barrel cortex) | `Topo::modules(n)` | 1 | `Millimetres` | one position per module, no structure inside |
+| a **cortical column**: radial × tangential, distance **collapsed** | `Topo::column(radial, tangential)` | 2 | **`Collapsed`** | laid out as `tangential × radial`; **produces no conduction delay** |
+| a **recursive grid** (hypercolumn: a sub-topology inside each tile) | `Topo::tiled(Kind::Grid, 8, 8, Kind::Ring)` | 2 | `Millimetres` | 8×8 outer tiles, each containing a sub-topology |
+
+Three things to keep in mind:
+
+1. **`LINE` / `GRID` turn positional differences into delay**; `column` does **not**
+   (inside a column "next to" is topological, not millimetres — treating it as metric
+   fabricates a delay). Getting this wrong produces no error, just a few silent milliseconds.
+2. The argument order of `column(radial, tangential)` is **radial first**: `u` is tangential,
+   `v` is radial, i.e. `column(6, 12)` = 6 layers deep × 12 tangential positions.
+3. `assign(n)` lays `n` neurons onto the shape — **the shape comes first, the count second**:
+   the same `GRID` works for 12 neurons or 12000.
+
+```rust
+topology: Topo::LINE,                        // S1 parcel: 1-D homunculus unfolding
+topology: Topo::column(6, 12),               // V1: 6 layers × 12 orientation columns (collapsed)
+topology: Topo::tiled(Kind::Grid, 8, 8, Kind::Ring),   // hypercolumn: position × orientation ring
+topology: Topo::POINT,                       // relay / modulatory nuclei
+```
+
+
+### 2.1 The seven shapes, measured (`cargo run --example topologies`)
+
+```
+area       Topo       tiled dims       metric    shape  first…last coordinate
+PointA     Point      -       0         None   (9, 1)  (0.50,0.50)…(0.50,0.50)
+LineB      Line       -       1  Millimetres   (9, 1)  (0.06,0.50)…(0.94,0.50)
+RingC      Ring       -       1  Millimetres   (9, 1)  (0.06,0.50)…(0.94,0.50)
+GridD      Grid       -       2  Millimetres   (3, 3)  (0.17,0.17)…(0.83,0.83)
+ModulesE   Modules    -       1  Millimetres   (9, 1)  (0.06,0.50)…(0.94,0.50)
+ColumnF    Grid       -       2    Collapsed   (3, 3)  (0.12,0.08)…(0.12,0.42)
+TiledG     Grid       yes     2  Millimetres   (3, 3)  (0.17,0.17)…(0.83,0.83)
+```
+
+Look at two things: **`ColumnF`'s metric is `Collapsed`** (positions inside a column produce
+no delay), and **`TiledG`'s tiled flag is `yes`** (outer Grid, Ring inside each tile).
+
+The same `GRID` holds 7 neurons or 48 — **shape first, count second**:
+
+```
+GRID with 7 neurons  → shape (3, 3), first coordinate (0.1667, 0.1667)
+GRID with 12 neurons → shape (4, 3), first coordinate (0.1250, 0.1667)
+GRID with 48 neurons → shape (7, 7), first coordinate (0.0714, 0.0714)
+```
+
+### 3. Slots and sub-regions (`Slot`)
+
+A slot is a port of the area. **Sub-regions must be declared on slots**, otherwise a
+projection cannot know which part to hit:
+
+```rust
+static SLOTS: [Slot; 2] = [
+    // afferent slot receiving only the "lower body" half (`Rect` in this area's own frame)
+    Slot::afferent("lower_body", TopoDomain::Somatic).with_region(Rect::of_u(0.0, 0.5)),
+    Slot::efferent("out", TopoDomain::Somatic),
+];
+```
+
+⚠️ **A `Rect` is expressed in the coordinate frame of the area that declares it.** The same
+"lower body" has different numbers in different areas:
+
+| Area | Its own axis | lower body |
+|---|---|---|
+| DRG (dermatome order) | lumbosacral → cervicothoracic | `[0.00, 0.50)` |
+| VPL (body-map position) | lateral → medial | `[0.56, 1.00)` |
+
+The two ends are aligned by `Map`, **not by equal numbers**.
+
+### 4. Projections (`Efferent`)
+
+```rust
+Efferent {
+    to: "MID", from_slot: "out", to_slot: "in",
+    projection: Projection::Feedforward,
+    map: Map::Identity, w: 2.0, fan_in: Some(24),
+}
+// shorthand:
+Efferent::topo("MID", "out", "in", Projection::Feedforward, 2.0, 24)
+```
+
+| `Map` | Meaning | Used for |
+|---|---|---|
+| `Identity` | coordinates map directly (order preserving) | retina→V1, body map→VPL |
+| `Affine{scale, offset, mirror}` | scale / shift / per-axis mirror | mirroring one side, local magnification |
+| `Permute{seed}` | geometry unchanged, **source labels shuffled** | **control** (proves order preservation does something) |
+| `AllToAll` | broadcast (non-topographic) | modulatory nuclei; must be written **explicitly** |
+
+Wiring rule: both ends have a topology and `map` is order-preserving → each target picks
+the nearest `fan_in` sources by coordinate; otherwise broadcast with `fan_in`.
+
+### 5. Cell templates and types (`Spec`)
+
+See the next section. In short: `neuron` is the template, `type_specs` gives per-type
+parameters, `tau_spread` creates individual differences, `mod_gain` decides which
+neuromodulators act on the cell.
+
+### 6. Assembly (`Module` / `Assembly`)
+
+```rust
+let mut asm = Assembly::new();
+asm.add(&RELAY_MOD, "L").add(&RELAY_MOD, "R")
+   .wire("L.out", "R.in", Projection::Feedforward, Map::Identity, 2.0, Some(12));
+let specs = asm.expand()?;                    // names become "L:RELAY" / "R:RELAY"
+let mut brain = Brain::declare(&specs, Config::default())?;
+```
+
+Rules: projections inside a part may only target areas of the same part; crossing a part
+boundary must go through a port; instance names and expanded names must be unique.
+
+### 7. Running and reading out
+
+| API | Meaning |
+|---|---|
+| `Brain::declare(&[AreaSpec], Config)` | declaration → brain; `Err(Vec<String>)` lists every problem (no panic) |
+| `brain.wire_local()` | local recurrence inside each area (separate switch) |
+| `brain.step(&ext, &Modulators)` | advance one step; `ext` is per-area drive |
+| `brain.rate_hz(i)` | mean firing rate (Hz) of area `i` since construction |
+| `brain.edges` | synapses generated per declared projection (observable) |
+| `brain.incoming` / `delay` / `i_bias` / `mod_gain` | per-neuron views (debugging) |
+
+### 8. What validation reports (cheat sheet)
+
+| Message | Meaning |
+|---|---|
+| `[区重名]` | duplicate area name in one declaration |
+| `[缺靶区]` / `[缺槽]` | an `Efferent` refers to a missing area/slot |
+| `[区域越界]` / `[区域无形状]` | invalid slot sub-region, or a sub-region on an area with no topology |
+| `[实例重名]` / `[连线无端口]` / `[连线方向不符]` / `[组内投射越界]` | assembly-level structural errors |
+
+### 9. How delay is computed
+
+```
+delay = 1 ms (synaptic transmission) + distance / 10 mm·ms⁻¹
+distance = area-centre distance + intra-area positional difference
+           (the intra-area term is added **only for a side whose metric is Millimetres**)
+then quantised by dt into ticks, clamped to 1..16
+```
+
+So at `dt = 0.5 ms`, two areas 8 mm apart give ≈4 ticks; the `column` side contributes
+no positional term.
 
 ---
 

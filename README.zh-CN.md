@@ -11,6 +11,19 @@
 
 ---
 
+## 目录
+
+- [快速上手](#声明--建脑--跑)（三区跑起来）
+- [**用法（完整）**](#用法完整)：字段表 / **区拓扑怎么设** / 槽与子区域 / 投射 / 细胞模板 / 组装 / 读数 / 校验报错 / 延迟算法
+  - [区拓扑怎么设](#2-区拓扑怎么设这是最容易踩的地方) ← **最容易踩的地方，必看**
+- [一个 Cell 模板 → 一群神经元](#一个-cell-模板--一群各有不同的神经元)
+- [调质（多巴胺等）](#调质是有名字的不是一个兴奋度标量)
+- [组装：脑是"拼起来"的](#组装脑是拼起来的)
+- [别的框架是怎么做的](#别的框架是怎么做的)
+- [设计原则](#设计原则)
+
+---
+
 ## 三个概念
 
 | 概念 | 说明 |
@@ -29,6 +42,7 @@
 ## 声明 → 建脑 → 跑
 
 ```rust
+use dreamkernel::core::cell::Modulators;
 use dreamkernel::sim::{Brain, Config};
 
 // …声明 SRC / MID / OUT（见 examples/minimal.rs）…
@@ -37,7 +51,7 @@ let mut brain = Brain::declare(&[SRC, MID, OUT], Config::default())?; // 声明 
 brain.wire_local();                                                  // 同区局部递归
 let mut ext = vec![0.0; brain.areas.len()];
 ext[0] = 1.2;                                                        // 只驱动第一个区
-for _ in 0..300 { brain.step(&ext, 1.0); }
+for _ in 0..300 { brain.step(&ext, &Modulators::default()); }
 println!("{} Hz", brain.rate_hz(0));
 ```
 
@@ -87,6 +101,194 @@ const MID: AreaSpec = AreaSpec {
 `Model::Rate` 是**模型选择，不是生物事实**：真实神经元不发"概率脉冲"。
 它的用途是把人工神经网络那套单元接进同一个引擎做对照，所以必须显式声明，
 而且默认激活用 ReLU（0 输入 → 0 发放；用 tanh 会让静止态发 50%）。
+
+---
+
+## 用法（完整）
+
+下面从"最小能跑"到"把区拓扑设对"，按步骤写。
+
+### 0. 五分钟
+
+```rust
+use dreamkernel::sim::{Brain, Config};
+use dreamkernel::core::cell::Modulators;
+
+let mut brain = Brain::declare(&[SRC, MID], Config::default())?;   // 声明 → 脑
+brain.wire_local();                                               // 同区局部递归
+let ext = vec![1.2, 0.0];                                         // 每区的外部驱动
+for _ in 0..300 { brain.step(&ext, &Modulators::default()); }
+println!("SRC {} Hz", brain.rate_hz(0));
+```
+
+### 1. 一个区有哪些字段（`AreaSpec`）
+
+| 字段 | 必填 | 说明 |
+|---|---|---|
+| `name` | ✓ | 区名（全局唯一；组装时会被加实例前缀） |
+| `class` | ✓ | `Cortex` / `ThalamicRelay{tonic}` / `SubcorticalRelay` / `PrimaryAfferent` / `Subcortical` / `Modulatory` / `Motor`。**决定权重档、背景、稳态目标** |
+| `topo` | ✓ | 模态标签：`Visual` / `Somatic` / `Auditory` / `None`（只用于"谁跟谁该保序"的配对检查） |
+| `micro` | ✓ | `Micro::cortical()/relay()/agranular()`：层构 + 抑制占比 |
+| `size` | ✓ | `Size::new(E, I, patches)`——**只用到 `patches`**；E/I 由 `Config` 决定 |
+| `layout` | ✓ | `Layout::mni([x,y,z], width)`：区中心与尺度（width 影响半边长=距离换算） |
+| `motif` | ✓ | 局部递归/前馈/反馈强度 |
+| `slots` | ✓ | 端口（见 §3） |
+| `topology` | ✓ | **区的形状**（见 §2） |
+| `efferents` | ✓ | 出向投射（见 §4）；`&[]` = 不声明 |
+| `neuron` | ✓ | 神经元模板（见 §5） |
+| `type_specs` | ✓ | 按类型的模板 `[P,PV,SOM,VIP]`；`&[]` = 四类都用 `neuron` |
+
+### 2. **区拓扑怎么设**（这是最容易踩的地方）
+
+拓扑决定三件事：①神经元在"图"上的坐标；②索引顺序（`assign(n)` 的顺序就是索引顺序，
+所以"索引 ↔ 坐标"永远同向）；③**坐标能不能当距离用**（`metric`，进而决定传导延迟）。
+
+| 你想表达 | 写法 | `dims()` | `metric` | 行为 |
+|---|---|---|---|---|
+| 没有空间（调质核、网状核） | `Topo::POINT` | 0 | `None` | 所有神经元同一个点；不产生任何距离 |
+| 一条**保序轴**（音调、一维体图表） | `Topo::LINE` | 1 | `Millimetres` | `u=(i+0.5)/n`；坐标就是毫米 |
+| **周期**量（朝向 0°/180°、头方向） | `Topo::RING` | 1 | `Millimetres` | 同上但 `u` 走最短环距（0 与 1 是邻居） |
+| **二维薄片**（视网膜图、二维体图） | `Topo::GRID` | 2 | `Millimetres` | `n` 自动铺成近正方形网格 |
+| `n` 个**离散模块**（桶状皮层） | `Topo::modules(n)` | 1 | `Millimetres` | 每模块一个位置，模块内无结构 |
+| **皮层柱**：径向×切向，距离**坍缩** | `Topo::column(radial, tangential)` | 2 | **`Collapsed`** | 铺成 `切向 × 径向` 网格；**不产生传导延迟** |
+| **递归网格**（超柱：格内再放子拓扑） | `Topo::tiled(Kind::Grid, 8, 8, Kind::Ring)` | 2 | `Millimetres` | 外层 8×8 格，每格内部再铺一个子拓扑 |
+
+三条要点：
+
+1. **`LINE` / `GRID` 会让"位置差"变成延迟**；`column` **不会**（柱内"相邻"是拓扑相邻，
+   不是毫米——把它当米制会凭空造出延迟）。选错了不会报错，只会悄悄多出几毫秒。
+2. `column(radial, tangential)` 的参数顺序是 **径向在前**：`u` 轴 = 切向、`v` 轴 = 径向，
+   即 `column(6, 12)` = 6 层深 × 12 个切向位置。
+3. `assign(n)` 把 n 个神经元铺到形状上——**形状先定、数量后配**，
+   同一个 `GRID` 可以是 12 个神经元也可以是 12000 个。
+
+```rust
+topology: Topo::LINE,                        // S1 的 parcel：一维 homunculus 展开
+topology: Topo::column(6, 12),               // V1：6 层深 × 12 个方位柱（距离坍缩）
+topology: Topo::tiled(Kind::Grid, 8, 8, Kind::Ring),   // 超柱：位置 × 方位环
+topology: Topo::POINT,                       // 中继核 / 调质核
+```
+
+
+### 2.1 七种形状的实测（`cargo run --example topologies`）
+
+```
+区          Topo       tiled dims       metric    shape  首/末坐标
+PointA     Point      -       0         None   (9, 1)  (0.50,0.50)…(0.50,0.50)
+LineB      Line       -       1  Millimetres   (9, 1)  (0.06,0.50)…(0.94,0.50)
+RingC      Ring       -       1  Millimetres   (9, 1)  (0.06,0.50)…(0.94,0.50)
+GridD      Grid       -       2  Millimetres   (3, 3)  (0.17,0.17)…(0.83,0.83)
+ModulesE   Modules    -       1  Millimetres   (9, 1)  (0.06,0.50)…(0.94,0.50)
+ColumnF    Grid       -       2    Collapsed   (3, 3)  (0.12,0.08)…(0.12,0.42)
+TiledG     Grid       yes     2  Millimetres   (3, 3)  (0.17,0.17)…(0.83,0.83)
+```
+
+看两处：**`ColumnF` 的 metric 是 `Collapsed`**（柱内位置不产生延迟），
+**`TiledG` 的 tiled 是 `yes`**（外层 Grid、格内 Ring）。
+
+同一个 `GRID` 可以是 7 个神经元也可以是 48 个——**形状先定，数量后配**：
+
+```
+GRID 铺 7 个神经元 → shape (3, 3)，首坐标 (0.1667, 0.1667)
+GRID 铺 12 个神经元 → shape (4, 3)，首坐标 (0.1250, 0.1667)
+GRID 铺 48 个神经元 → shape (7, 7)，首坐标 (0.0714, 0.0714)
+```
+
+### 3. 槽与子区域（`Slot`）
+
+槽 = 区的端口。**子区域必须写在槽上**，投射才知道接哪一块：
+
+```rust
+static SLOTS: [Slot; 2] = [
+    // 入向槽：只接"下半身"那一半（`Rect` 在本区自己的坐标系里）
+    Slot::afferent("lower_body", TopoDomain::Somatic).with_region(Rect::of_u(0.0, 0.5)),
+    Slot::efferent("out", TopoDomain::Somatic),
+];
+```
+
+⚠️ **`Rect` 是在声明它的区自己的坐标系里说的**。同一个"下半身"，在两个区里数值不同：
+
+| 区 | 自己的轴 | 下半身 |
+|---|---|---|
+| DRG（皮节段序） | 腰骶 → 颈胸 | `[0.00, 0.50)` |
+| VPL（体图位置） | 外侧 → 内侧 | `[0.56, 1.00)` |
+
+两端靠 `Map` 对齐，**不靠数值相等**。
+
+### 4. 投射（`Efferent`）
+
+```rust
+Efferent {
+    to: "MID",              // 靶区名（同部件内）
+    from_slot: "out",       // 本区哪个出向槽
+    to_slot: "in",          // 靶区哪个入向槽
+    projection: Projection::Feedforward,
+    map: Map::Identity,     // 两端拓扑怎么对齐
+    w: 2.0,                 // 单突触权重倍率
+    fan_in: Some(24),       // 每个靶细胞收多少源细胞（None = 引擎默认）
+}
+// 常用简写：
+Efferent::topo("MID", "out", "in", Projection::Feedforward, 2.0, 24)
+```
+
+`map` 的四个选择：
+
+| `Map` | 含义 | 用在哪 |
+|---|---|---|
+| `Identity` | 坐标直接对应（保序） | 视网膜图→V1、体图→VPL |
+| `Affine{scale, offset, mirror}` | 缩放/平移/逐轴镜像 | 一侧镜像到另一侧、局部放大 |
+| `Permute{seed}` | 几何不变、**源标签打乱** | **对照**（证明保序真的在起作用） |
+| `AllToAll` | 广播（无地形） | 调质核团；**必须显式写**，不写等于没声明 |
+
+建边规则：两端都有拓扑且 `map` 保序 → 按坐标找最近的 `fan_in` 个源；
+否则按 `fan_in` 广播。
+
+### 5. 细胞模板与类型（`Spec`）
+
+见下一节"一个 Cell 模板 → 一群各有不同的神经元"。要点：`neuron` 是模板，
+`type_specs` 给四类各自的参数，`tau_spread` 造个体差异，`mod_gain` 决定受哪种调质影响。
+
+### 6. 组装（`Module` / `Assembly`）
+
+```rust
+let mut asm = Assembly::new();
+asm.add(&RELAY_MOD, "L").add(&RELAY_MOD, "R")
+   .wire("L.out", "R.in", Projection::Feedforward, Map::Identity, 2.0, Some(12));
+let specs = asm.expand()?;                    // 区名变成 "L:RELAY" / "R:RELAY"
+let mut brain = Brain::declare(&specs, Config::default())?;
+```
+
+规矩：部件内部投射只能指向同部件的区；跨部件必须走端口；实例名与展开名都唯一。
+
+### 7. 运行与读数
+
+| API | 说明 |
+|---|---|
+| `Brain::declare(&[AreaSpec], Config)` | 声明 → 脑；`Err(Vec<String>)` 列出全部声明问题（不 panic） |
+| `brain.wire_local()` | 同区局部递归（不属于跨区声明，单独开关） |
+| `brain.step(&ext, &Modulators)` | 走一步；`ext` 是每区驱动 |
+| `brain.rate_hz(i)` | 第 i 个区自建脑以来的平均发放率（Hz） |
+| `brain.edges` | 每条声明生成了多少突触（可观测） |
+| `brain.incoming` / `delay` / `i_bias` / `mod_gain` | 逐神经元视图（调试用） |
+
+### 8. 校验会报什么（速查）
+
+| 错误串 | 含义 |
+|---|---|
+| `[区重名]` | 同一份声明里区名重复 |
+| `[缺靶区]` / `[缺槽]` | `Efferent` 指向不存在的区/槽 |
+| `[区域越界]` / `[区域无形状]` | 槽的子区域非法，或区没声明拓扑却要子区域 |
+| `[实例重名]` / `[连线无端口]` / `[连线方向不符]` / `[组内投射越界]` | 组装层的结构错误 |
+
+### 9. 延迟怎么算
+
+```
+delay = 1ms（突触传递本身） + 距离/10mm·ms⁻¹
+距离 = 区中心距离 + 区内位置差（**只在一侧是 Millimetres 时才算那侧的区内位置差**）
+再按 dt 量化成 tick，夹在 1..16
+```
+
+所以：`dt=0.5ms`、两区相距 8mm ⇒ 约 4 tick；`column` 那一侧不贡献位置差。
 
 ---
 
