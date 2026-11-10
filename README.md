@@ -88,8 +88,8 @@ OUT 的**跨区**入边延迟：4–4 tick（MID 是坍缩档：区内位置不�
 
 ## 规格
 
-* `docs/74-topology.md`：拓扑代数、连接映射、三档精度、迁移三步。
-* `docs/75-framework-vs-implementation.md`：框架层与实现层的边界。
+* 拓扑代数、连接映射、三档精度：见 `src/core/topo.rs` 的模块文档。
+* 「声明 → 建脑」：见 `examples/minimal.rs`。
 
 ## 许可
 

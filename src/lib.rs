@@ -9,7 +9,7 @@
 //!   什么区叫什么、接哪条通路，是实现层的事。
 //! * **能不崩就不崩**：校验返回**全部**问题，而不是第一个就 panic。
 //!
-//! 规格：`docs/74-topology.md`（拓扑）、`docs/75-framework-vs-implementation.md`（分层）。
+//! 两层分工：本 crate 只出"机制"；具体是哪个脑（哪些区、哪条通路）由使用它的 crate 提供。
 
 pub mod core;
 pub mod link;

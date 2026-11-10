@@ -1,6 +1,6 @@
 //! AdLIF 神经元：每神经元自己的时间常数、适应与阈值。
 //!
-//! 对应 docs/07 §6（AdLIF）与 docs/09 §13（细胞级记忆）。
+//! 对应 （AdLIF）与 （细胞级记忆）。
 //! 与文档的差别：参数从"每群体一套"改成"每神经元一套"——
 //! H-N1 要检验异质时间常数是否优于同质。
 //!
@@ -23,7 +23,7 @@ pub use crate::core::cell::CellType;
 /// 没有它神经元可以每步发放（1000 Hz），与生物事实不符。
 pub const REFRACTORY_STEPS: u8 = 1;
 
-/// 单个神经元的参数。比 docs/07 的"群体参数"多了两个自由度：
+/// 单个神经元的参数。比"每群体一套"多了两个自由度：
 /// `tau_m`/`tau_a` 可以让每个神经元不同（H-N1 的自变量）。
 #[derive(Debug, Clone, Copy)]
 pub struct Params {
@@ -329,7 +329,7 @@ mod tests {
 
     #[test]
     fn shunting_depends_on_membrane_potential() {
-        // 判据（docs/19 §1 ④）：同输入、不同膜电位 → 抑制电流不同。
+        // 判据：同输入、不同膜电位 → 抑制电流不同。
         // 电流型：抑制 = 常数减法；电导型：抑制电流 = g_i·(E_I − V)，随 V 变。
         let p = Params {
             theta: 10.0, // 不发放，只看亚阈值的稳态

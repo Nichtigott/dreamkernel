@@ -85,7 +85,7 @@ impl Span {
     }
 }
 
-/// 一条投射的**微观规格**（用户 2026-11-09：「实际会更微观啊」）。
+/// 一条投射的**微观规格**：不只说"整区到整区"，还要说"哪群细胞到哪群细胞"。
 ///
 /// 字段与"团→团"缺口的对应关系：
 /// - `from`/`to`（区）、`from_layer`/`to_layer`（层）：已在 `Edge.from`/`Edge.to` 两个
@@ -98,7 +98,7 @@ impl Span {
 /// - `w`：单突触权重倍率；`1.0` = 用方向档（丘脑-皮层 2.0 / 其余 0.25）。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Arbor {
-    /// 两端拓扑怎么对齐（docs/74 §4）。`AllToAll` = **没声明几何** → 走旧的 span 窗口。
+    /// 两端拓扑怎么对齐。`AllToAll` = **没声明几何** → 走旧的 span 窗口。
     /// 只有两端都是二维拓扑（`dims()==2`）且 `map.is_topographic()` 时，
     /// 建边才走"按坐标配对"的路径。
     pub map: Map,
@@ -221,7 +221,7 @@ impl Efferent {
 ///
 /// 它**不进** `Graph::edges`：因为 a→b 的突触不是"整条投射一个权重"，而是要在
 /// 靶区神经元上按 `w` 分配一个固定的区际扇入预算（见 spiking.rs 的
-/// `cortico_fan` 两级分配与 docs/55 §3.2）。放进 edges 会让每条边按 patch 复制、
+/// `cortico_fan` 两级分配与 ）。放进 edges 会让每条边按 patch 复制、
 /// 突触数随区数线性膨胀（那是 v1 的老写法）。
 ///
 /// 区表 v3 起 `src/dst` 存的是 **RM region 编号**（不是 180 个 Glasser parcel 索引）：
@@ -234,13 +234,13 @@ pub struct ConnEdge {
     /// true = 上行（落 L4），false = 下行（落 L1/L6）。方向不是实测，是按推断层级分的，
     /// 可用 CORTICO_FLAT=1 全部按 ff 处理（消融）。
     pub ff: bool,
-    /// 方向证据（docs/65，2026-11-08）：该**有向边**的方向被人类证据支持且置信 ≥ medium
+    /// 方向证据：该**有向边**的方向被人类证据支持且置信 ≥ medium
     /// （CSV `dir_inferred∈{ff,fb}`、`dir_conf∈{high,medium}`，且与 `ff` 一致）。
     /// 默认 false（无证据）。只在 `LAMINAR_INTER_EVID=1` 时参与层靶向（"扫雷"增量模式）。
     pub dir_evid: bool,
     /// 实测束长（mm）。本轮不用于延迟（Uniform 模式所有突触 = 1 tick），留给 W2b。
     pub dist_mm: f32,
-    /// 实测权重（列归一化矩阵的份额，见 docs/55 §1.3）
+    /// 实测权重（列归一化矩阵的份额，见 ）
     pub w_meas: f32,
     /// 模型权重 exp(-λ·dist_mm)，λ=0.150 mm^-1（Ercsey-Ravasz 2013），消融用
     pub w_edr: f32,

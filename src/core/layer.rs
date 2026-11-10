@@ -78,7 +78,7 @@ impl LaminarProfile {
 
     /// 分化不良（dysgranular）：层 IV 存在但薄。**中间型**，不能挤到颗粒或无颗粒里。
     /// 解剖依据：运动前区/前额/部分扣带与颞极属此型（见 world/data/rm41_regions.csv
-    /// 的 `laminar_profile` 列 + docs/53 §4.1）。0.45 这个具体宽度是**模型**选择（不是实测值），
+    /// 的层构列）。0.45 这个具体宽度是**模型**选择（不是实测值），
     /// 不是测量值：它决定该区神经元摊到 L4 的比例（spiking.rs 按层宽比例分层）。
     pub const fn dysgranular() -> Self {
         Self {
