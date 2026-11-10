@@ -8,6 +8,7 @@
 //! 两条投射都**由声明生成**（源/靶子区域从槽的 `region` 取，两端用 `Map` 对齐）。
 //! 然后给 `SRC` 一点驱动电流，看发放怎么传到下游、以及延迟怎么随距离变。
 
+use dreamkernel::core::cell::{Model, Spec};
 use dreamkernel::core::area::{AreaClass, AreaSpec, Layout, LocalMotif, Micro, Size, Slot, TopoDomain};
 use dreamkernel::core::topo::Topo;
 use dreamkernel::link::projection::{Efferent, Projection};
@@ -43,6 +44,7 @@ const SRC: AreaSpec = AreaSpec {
     // ③ 1:1 米制：坐标就是毫米，距离会变成传导延迟
     topology: Topo::LINE,
     efferents: &SRC_EFF,
+    neuron: Spec::new(Model::AdLif),
 };
 
 const MID: AreaSpec = AreaSpec {
@@ -56,6 +58,8 @@ const MID: AreaSpec = AreaSpec {
     slots: &MID_SLOTS,
     // ② 柱状：切向 8 × 径向 4，距离**坍缩**（不该凭空造出延迟）
     topology: Topo::column(4, 8),
+    // 这个区用**发放率单元**（RNN 味道）而不是脉冲模型——模型也是可声明的
+    neuron: Spec::new(Model::Rate).with_gain(0.01),
     efferents: &MID_EFF,
 };
 
@@ -70,6 +74,7 @@ const OUT: AreaSpec = AreaSpec {
     slots: &OUT_SLOTS,
     topology: Topo::POINT,
     efferents: &[],
+    neuron: Spec::new(Model::AdLif),
 };
 
 fn main() {

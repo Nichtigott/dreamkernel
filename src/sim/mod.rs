@@ -15,8 +15,9 @@
 //! 层号由 `LaminarProfile` 的宽度比例分配——与实现层的约定一致，但不读那份数据。
 
 use crate::core::area::{Area, AreaSpec};
-use crate::core::cell::CellType;
+use crate::core::cell::{CellType, Model, Spec};
 use crate::core::layer::Layer;
+use crate::core::cell::RateUnit;
 use crate::core::neuron::{Neuron, Params};
 use crate::core::topo::{Coord, Topo};
 use crate::link::projection::Projection;
@@ -67,6 +68,34 @@ pub struct BuiltEdge {
     pub synapses: usize,
 }
 
+/// 运行时神经元：把不同模型的 `step` 统一成 `-> bool`。
+pub enum Cell {
+    /// AdLIF（含 `Model::Lif`：β=0 的特例）。
+    Spiking(Neuron),
+    /// 发放率单元（`Model::Rate`）：按激活值作概率发放。
+    Rate(RateUnit),
+}
+
+impl Cell {
+    /// 走一步；返回"这一步是否发放/触发"。
+    pub fn step(&mut self, input: f32, rng: &mut crate::num::math::Lcg) -> bool {
+        match self {
+            Cell::Spiking(n) => n.step(input),
+            Cell::Rate(r) => {
+                let y = r.forward(input);
+                // ANN→SNN 桥接：以激活值为发放概率（`Model::Rate` 的说明里写明这是模型选择）
+                rng.next_f32() < y
+            }
+        }
+    }
+    pub fn reset(&mut self) {
+        match self {
+            Cell::Spiking(n) => n.reset(),
+            Cell::Rate(r) => r.reset(),
+        }
+    }
+}
+
 /// 一个能跑的脑。
 pub struct Brain {
     pub areas: Vec<Area>,
@@ -78,7 +107,8 @@ pub struct Brain {
     pub layer_of: Vec<u8>,
     /// 每神经元坐标（该区拓扑上的位置；`Point` 时全为 (0.5, 0.5)）。
     pub coord_of: Vec<Coord>,
-    pub neurons: Vec<Neuron>,
+    /// 逐神经元**模型实例**（AdLif/Lif 用 AdLIF 实现，Rate 用 `RateUnit`）。
+    pub neurons: Vec<Cell>,
     /// 逐神经元的入边 `(pre, w)`。
     pub incoming: Vec<Vec<(usize, f32)>>,
     /// 逐神经元的入边延迟（ms，量化到整数步）。
@@ -100,6 +130,8 @@ pub struct Brain {
     pub spike_count: Vec<u32>,
     /// 最近一步是否发放。
     pub spikes: Vec<bool>,
+    /// 运行时随机源（ 单元的概率发放用；同种子可复现）。
+    rng: crate::num::math::Lcg,
 }
 
 impl Brain {
@@ -196,8 +228,7 @@ impl Brain {
                     let frac = (j as f32 + 0.5) / n.max(1) as f32;
                     layer_of.push(layer_at(&present, &a.profile.width, frac));
                     coord_of.push(*c);
-                    let prm = params_for(t, cfg.dt_ms);
-                    neurons.push(Neuron::new(prm));
+                    neurons.push(cell_from(a.neuron, params_for(t, cfg.dt_ms)));
                     let _ = k;
                 }
             }
@@ -223,6 +254,7 @@ impl Brain {
             max_delay: 1,
             spike_count: vec![0u32; n],
             spikes: vec![false; n],
+            rng,
         }
     }
 
@@ -437,7 +469,7 @@ impl Brain {
             let a = self.area_of[i];
             let e = ext.get(a).copied().unwrap_or(0.0) + self.cfg.ext_base;
             let inp = syn[i] + self.input[i] + e;
-            fired[i] = self.neurons[i].step(inp);
+            fired[i] = self.neurons[i].step(inp, &mut self.rng);
             if fired[i] {
                 self.spike_count[i] += 1;
             }
@@ -463,6 +495,15 @@ impl Brain {
 
     pub fn n_neurons(&self) -> usize {
         self.neurons.len()
+    }
+}
+
+/// 按区声明的 `Spec` 造一个运行时神经元。
+fn cell_from(spec: Spec, default_spiking: Params) -> Cell {
+    match spec.model {
+        Model::Rate => Cell::Rate(RateUnit::new(spec)),
+        // AdLif 与 Lif 共用同一份 AdLIF 实现：Lif 就是 β=0 的特例
+        Model::AdLif | Model::Lif => Cell::Spiking(Neuron::new(default_spiking)),
     }
 }
 
@@ -540,6 +581,7 @@ mod tests {
             slots: &SRC_SLOTS,
             topology: Topo::LINE,
             efferents: &SRC_EFF,
+            neuron: crate::core::cell::Spec::default(),
         }
     }
 
@@ -555,6 +597,7 @@ mod tests {
             slots: &DST_SLOTS,
             topology: Topo::POINT,
             efferents: &[],
+            neuron: crate::core::cell::Spec::default(),
         }
     }
 
@@ -609,5 +652,75 @@ mod tests {
             b.spike_count.clone()
         };
         assert_eq!(run(), run(), "同一种子必须逐位可复现（判据的前提）");
+    }
+}
+
+#[cfg(test)]
+mod cell_model_tests {
+    use super::*;
+    use crate::core::area::{AreaClass, Layout, LocalMotif, Micro, Size, Slot, TopoDomain};
+    use crate::core::cell::{Model, Spec};
+    use crate::link::projection::Efferent;
+
+    static SL: [Slot; 1] = [Slot::afferent("in", TopoDomain::None)];
+
+    fn area(name: &'static str, spec: Spec, eff: &'static [Efferent]) -> AreaSpec {
+        AreaSpec {
+            name,
+            class: AreaClass::Cortex,
+            topo: TopoDomain::None,
+            micro: Micro::cortical(),
+            size: Size::new(16, 4, 1),
+            layout: Layout::mni([0.0, 0.0, 0.0], 0.5),
+            motif: LocalMotif::cortical(),
+            slots: &SL,
+            topology: Topo::POINT,
+            efferents: eff,
+            neuron: spec,
+        }
+    }
+
+    static NO_EFF: [Efferent; 0] = [];
+
+    /// **模型是区声明的一部分**：同一个引擎里可以同时跑脉冲模型与发放率单元。
+    #[test]
+    fn heterogeneous_cell_models_in_one_brain() {
+        let a = area("A", Spec::new(Model::AdLif), &NO_EFF);
+        let b = area("B", Spec::new(Model::Lif), &NO_EFF);
+        let c = area(
+            "C",
+            Spec::new(Model::Rate).with_gain(0.05).with_act(crate::core::cell::Act::Relu),
+            &NO_EFF,
+        );
+        let mut brain = Brain::declare(&[a, b, c], Config { n_exc: 16, n_inh: 4, ..Default::default() })
+            .expect("声明应当合法");
+        // 三种模型各建出各的类型
+        assert!(matches!(brain.neurons[0], Cell::Spiking(_)));
+        assert!(matches!(brain.neurons[20], Cell::Spiking(_)), "Lif 复用 AdLIF 实现");
+        assert!(matches!(brain.neurons[40], Cell::Rate(_)), "Rate 是另一类单元");
+        // 只有 A 被驱动：Rate 单元静息（0 输入）不该发放
+        let mut ext = vec![0.0f32; 3];
+        ext[0] = 6.0;
+        for _ in 0..100 {
+            brain.step(&ext, 1.0);
+        }
+        assert!(brain.rate_hz(0) > 0.0, "被驱动的脉冲区应发放");
+        assert_eq!(brain.rate_hz(2), 0.0, "0 输入时 Rate 单元必须静息（ReLU）");
+    }
+
+    /// 同一个随机种子下，含 Rate 单元的脑也必须逐位可复现。
+    #[test]
+    fn rate_units_are_reproducible() {
+        let run = || {
+            let a = area("A", Spec::new(Model::Rate).with_gain(0.5), &NO_EFF);
+            let mut b = Brain::declare(&[a], Config { n_exc: 16, n_inh: 0, seed: 3, ..Default::default() })
+                .unwrap();
+            let ext = vec![4.0f32];
+            for _ in 0..200 {
+                b.step(&ext, 1.0);
+            }
+            b.spike_count.clone()
+        };
+        assert_eq!(run(), run(), "概率发放也必须由种子决定");
     }
 }

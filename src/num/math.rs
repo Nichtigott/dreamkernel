@@ -117,3 +117,122 @@ impl Lcg {
         if n == 0 { 0 } else { (self.next_f32() * n as f32) as usize % n }
     }
 }
+
+/// Logistic sigmoid：`1/(1+e^{-x})`。用 `exp32` 实现，跨平台可复现。
+pub fn sigmoid(x: f32) -> f32 {
+    // 分成两段避免 exp 溢出：x>=0 与 x<0 对称写法
+    if x >= 0.0 {
+        let e = exp32(-x);
+        1.0 / (1.0 + e)
+    } else {
+        let e = exp32(x);
+        e / (1.0 + e)
+    }
+}
+
+/// `tanh` = 2·sigmoid(2x) − 1。**不要**用 `f32::tanh`：它在不同 libm 上末位可能不同，
+/// 而本项目的判据要求"同种子逐位可复现"。
+pub fn tanh32(x: f32) -> f32 {
+    2.0 * sigmoid(2.0 * x) - 1.0
+}
+
+/// ReLU（负半轴截零）。
+pub fn relu(x: f32) -> f32 {
+    if x > 0.0 { x } else { 0.0 }
+}
+
+/// 点积（等长取较短；长度不等是调用方的错，不在这里 panic）。
+pub fn dot(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+}
+
+/// 线性插值。
+pub fn lerp(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t.clamp(0.0, 1.0)
+}
+
+/// 就地 softmax（数值稳定版：先减最大值）。
+pub fn softmax_inplace(x: &mut [f32]) {
+    if x.is_empty() {
+        return;
+    }
+    let m = x.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let mut s = 0.0f32;
+    for v in x.iter_mut() {
+        *v = exp32(*v - m);
+        s += *v;
+    }
+    if s > 0.0 {
+        for v in x.iter_mut() {
+            *v /= s;
+        }
+    }
+}
+
+/// 最大值的下标（空切片返回 `None`）。
+pub fn argmax(x: &[f32]) -> Option<usize> {
+    let mut best: Option<(usize, f32)> = None;
+    for (i, &v) in x.iter().enumerate() {
+        if best.is_none_or(|(_, b)| v > b) {
+            best = Some((i, v));
+        }
+    }
+    best.map(|(i, _)| i)
+}
+
+#[cfg(test)]
+mod activation_tests {
+    use super::*;
+
+    #[test]
+    fn sigmoid_and_tanh_are_consistent() {
+        // tanh(x) = 2σ(2x) − 1 必须**逐位**成立（同一份实现推出来的）
+        for x in [-6.0f32, -1.0, -0.1, 0.0, 0.3, 2.0, 9.0] {
+            assert_eq!(tanh32(x), 2.0 * sigmoid(2.0 * x) - 1.0, "x={x}");
+        }
+        assert!((sigmoid(0.0) - 0.5).abs() < 1e-7);
+        assert!(sigmoid(50.0) <= 1.0 && sigmoid(-50.0) >= 0.0);
+        // 饱和：正值侧 f32 下就是 1.0；负值侧是小正数（exp32(-50)≈1.9e-22），不是精确 0
+        assert_eq!(sigmoid(50.0), 1.0);
+        assert!(sigmoid(-50.0) < 1e-20 && sigmoid(-50.0) >= 0.0);
+    }
+
+    #[test]
+    fn softmax_is_a_distribution_and_shift_invariant() {
+        let mut a = [1.0f32, 2.0, 3.0];
+        softmax_inplace(&mut a);
+        let s: f32 = a.iter().sum();
+        assert!((s - 1.0).abs() < 1e-6, "{a:?}");
+        assert!(a[2] > a[1] && a[1] > a[0]);
+        // 平移不变（数值稳定性的关键）
+        let mut b = [101.0f32, 102.0, 103.0];
+        softmax_inplace(&mut b);
+        for i in 0..3 {
+            assert!((a[i] - b[i]).abs() < 1e-6, "{a:?} vs {b:?}");
+        }
+    }
+
+    #[test]
+    fn dot_lerp_argmax() {
+        assert_eq!(dot(&[1.0, 2.0], &[3.0, 4.0]), 11.0);
+        assert_eq!(dot(&[1.0], &[3.0, 4.0]), 3.0, "取较短");
+        assert_eq!(lerp(0.0, 10.0, 0.25), 2.5);
+        assert_eq!(lerp(0.0, 10.0, 2.0), 10.0, "t 被夹住");
+        assert_eq!(argmax(&[1.0, 5.0, 5.0]), Some(1), "并列取第一个");
+        assert_eq!(argmax(&[]), None);
+        assert_eq!(relu(-3.0), 0.0);
+    }
+
+    #[test]
+    fn lcg_is_reproducible_and_in_range() {
+        let mut a = Lcg::new(7);
+        let mut b = Lcg::new(7);
+        for _ in 0..1000 {
+            let x = a.next_f32();
+            assert!((0.0..1.0).contains(&x), "{x}");
+            assert_eq!(x, b.next_f32(), "同种子必须逐位一致");
+        }
+        assert!(Lcg::new(1).next_below(5) < 5);
+        assert_eq!(Lcg::new(1).next_below(0), 0);
+    }
+}

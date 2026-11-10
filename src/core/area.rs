@@ -130,6 +130,8 @@ pub struct Area {
     pub class: Option<AreaClass>,
     /// **显式声明**的拓扑域（同上）。
     pub topo: Option<TopoDomain>,
+    /// 该区的**神经元模型**（`Spec`：AdLif / Lif / Rate）。
+    pub neuron: crate::core::cell::Spec,
     /// 该区**自己声明**的出向投射（由 `AreaSpec::to_area()` 填入）。
     /// 建脑时从这里**自动生成边**——这就是"声明即生成"。
     pub efferents: &'static [crate::link::projection::Efferent],
@@ -402,6 +404,9 @@ pub struct AreaSpec {
     /// 该区**自己声明**的出向投射（见 [`crate::link::projection::Efferent`]）。
     /// 空切片 = 只靠中央 `add_edge` 声明（历史写法）。
     pub efferents: &'static [crate::link::projection::Efferent],
+    /// 该区用哪种**神经元模型**（默认 AdLIF）。写进区声明，所以"这个区是脉冲的还是
+    /// 发放率单元"是可声明的，而不是引擎里写死。
+    pub neuron: crate::core::cell::Spec,
 }
 
 impl AreaSpec {
@@ -416,6 +421,7 @@ impl AreaSpec {
             width: self.layout.width,
             class: Some(self.class),
             topo: Some(self.topo),
+            neuron: self.neuron,
             efferents: self.efferents,
             slots: self.slots,
             topology: self.topology,
