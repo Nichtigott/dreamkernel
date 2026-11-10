@@ -396,6 +396,20 @@ Path::Via([0.0, 12.0, 0.0])        // through a waypoint: corpus callosum over t
 Path::Fixed(60.0)                  // measured fibre length in mm (geometry ignored)
 ```
 
+
+**3. Give the actual path, not a number.** `Path::Polyline` takes the fibre's real course as
+a point list (from tractography, an atlas, or just a hand-drawn polyline) and computes the
+length itself:
+
+```rust
+static CURVE: [[f32; 3]; 2] = [[4.0, 6.0, 0.0], [6.0, 6.0, 0.0]];
+let p = Path::polyline(&CURVE);   // length = |a→p0| + |p0→p1| + |p1→b|
+```
+
+Measured on two areas 8 mm apart (`dt = 0.5 ms`): straight **4** ticks, shallow detour
+(2 mm up) **5**, deeper detour (6 mm up and along) **6**. An empty point list is exactly
+`Path::Straight`.
+
 Measured with two areas 8 mm apart (`dt = 0.5 ms`):
 
 ```

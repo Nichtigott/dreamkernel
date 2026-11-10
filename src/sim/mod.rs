@@ -1330,3 +1330,62 @@ mod path_and_memory_tests {
         println!("[mem] 延迟内存：Stored {bytes_stored} B → Derived {bytes_derived} B");
     }
 }
+
+#[cfg(test)]
+mod polyline_path_tests {
+    use super::*;
+    use crate::core::area::{AreaClass, Layout, LocalMotif, Micro, Size, Slot, TopoDomain};
+    use crate::link::projection::{Efferent, Path, Projection};
+
+    static OUT: [Slot; 1] = [Slot::efferent("out", TopoDomain::Somatic)];
+    static IN: [Slot; 1] = [Slot::afferent("in", TopoDomain::Somatic)];
+
+    fn area(name: &'static str, slots: &'static [Slot], pos: [f32; 3]) -> AreaSpec {
+        AreaSpec {
+            name,
+            class: AreaClass::Cortex,
+            topo: TopoDomain::Somatic,
+            micro: Micro::cortical(),
+            size: Size::new(16, 0, 1),
+            layout: Layout::mni(pos, 1.0),
+            motif: LocalMotif::cortical(),
+            slots,
+            topology: Topo::LINE,
+            efferents: &[],
+            neuron: crate::core::cell::Spec::new(crate::core::cell::Model::Lif).with_bias(2.0),
+            type_specs: &[],
+        }
+    }
+
+    fn max_delay(path: Path) -> u8 {
+        let eff: &'static [Efferent] = Box::leak(
+            vec![Efferent { path, ..Efferent::topo("B", "out", "in", Projection::Feedforward, 1.0, 8) }]
+                .into_boxed_slice(),
+        );
+        let mut a = area("A", &OUT, [0.0, 0.0, 0.0]);
+        a.efferents = eff;
+        let b = area("B", &IN, [8.0, 0.0, 0.0]);
+        let brain = Brain::declare(
+            &[a, b],
+            Config { n_exc: 16, n_inh: 0, dt_ms: 0.5, seed: 2, ..Default::default() },
+        )
+        .expect("声明应当合法");
+        let (s, e) = (brain.area_start[1], brain.area_start[2]);
+        brain.delay[s..e].iter().flatten().copied().max().unwrap_or(0)
+    }
+
+    /// **给实际路径点集**：延迟按折线长度算，绕得越远越慢。
+    #[test]
+    fn real_polyline_path_drives_the_delay() {
+        static SHALLOW: [[f32; 3]; 1] = [[4.0, 2.0, 0.0]];
+        static DEEP: [[f32; 3]; 2] = [[4.0, 6.0, 0.0], [6.0, 6.0, 0.0]];
+        let (straight, shallow, deep) = (
+            max_delay(Path::Straight),
+            max_delay(Path::polyline(&SHALLOW)),
+            max_delay(Path::polyline(&DEEP)),
+        );
+        println!("[polyline] 直 {straight} / 浅绕 {shallow} / 深绕 {deep} tick");
+        assert!(shallow > straight, "绕 2mm 应当更慢");
+        assert!(deep > shallow, "绕得更远必须更慢");
+    }
+}

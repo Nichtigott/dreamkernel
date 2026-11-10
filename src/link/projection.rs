@@ -202,6 +202,18 @@ pub enum Path {
     Via([f32; 3]),
     /// 固定长度（毫米）——已有实测纤维长度时用这个，几何被忽略。
     Fixed(f32),
+    /// **实际路径**：一串点（毫米，MNI 坐标）。长度 = 折线长度
+    /// （起端→p0→p1→…→末端，逐段求和）。
+    ///
+    /// 这是"给路径而不是给一个值"的写法：把纤维的真实走线（从成像/图谱里
+    /// 抽出来的点集，或手工描的几段）直接给出来，长度由这里算。
+    /// 空切片等价于 [`Path::Straight`]。
+    Polyline(&'static [[f32; 3]]),
+}
+
+/// 两个 MNI 点之间的直线距离（毫米）。
+fn dist3(a: [f32; 3], b: [f32; 3]) -> f32 {
+    ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
 }
 
 impl Path {
@@ -216,7 +228,23 @@ impl Path {
                 d1 + d2
             }
             Path::Fixed(mm) => mm.max(0.0),
+            Path::Polyline(pts) => {
+                if pts.is_empty() {
+                    return euclid;
+                }
+                // 起端 → 各点 → 末端，逐段求和
+                let mut len = dist3(a, pts[0]);
+                for w in pts.windows(2) {
+                    len += dist3(w[0], w[1]);
+                }
+                len + dist3(pts[pts.len() - 1], b)
+            }
         }
+    }
+
+    /// 折线路径的便捷构造。
+    pub const fn polyline(pts: &'static [[f32; 3]]) -> Self {
+        Path::Polyline(pts)
     }
 }
 
@@ -331,5 +359,46 @@ mod tests {
         assert!(!Arbor { topo: true, ..Arbor::coarse() }.is_coarse());
         assert!(!Arbor::topo(Span::ALL, Span::ALL, 32).is_coarse());
         assert!(!Arbor::span(Span::new(0.0, 0.5), Span::ALL).is_coarse());
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+
+    /// 折线长度 = 起端→各点→末端逐段求和；空折线等价于直线。
+    #[test]
+    fn polyline_length_is_sum_of_segments() {
+        let a = [0.0, 0.0, 0.0];
+        let b = [10.0, 0.0, 0.0];
+        let straight = Path::Straight.length_mm(a, b, 10.0);
+        assert!((straight - 10.0).abs() < 1e-5);
+
+        // 往上绕 5mm 再回来：两段 5√2 ≈ 14.14
+        static UP: [[f32; 3]; 1] = [[5.0, 5.0, 0.0]];
+        let detour = Path::polyline(&UP).length_mm(a, b, 10.0);
+        assert!((detour - 2.0 * (5.0f32 * 5.0 + 5.0 * 5.0).sqrt()).abs() < 1e-4, "{detour}");
+        assert!(detour > straight);
+
+        // 多点折线：a→(5,0,0)→(5,5,0)→b
+        static ZIG: [[f32; 3]; 2] = [[5.0, 0.0, 0.0], [5.0, 5.0, 0.0]];
+        let zig = Path::polyline(&ZIG).length_mm(a, b, 10.0);
+        assert!((zig - (5.0 + 5.0 + (25.0f32 + 25.0).sqrt())).abs() < 1e-4, "{zig}");
+
+        // 空折线 = 直线
+        static EMPTY: [[f32; 3]; 0] = [];
+        assert!((Path::polyline(&EMPTY).length_mm(a, b, 10.0) - 10.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn polyline_is_monotone_in_detour_length() {
+        let a = [0.0, 0.0, 0.0];
+        let b = [8.0, 0.0, 0.0];
+        static P1: [[f32; 3]; 1] = [[4.0, 1.0, 0.0]];
+        static P2: [[f32; 3]; 1] = [[4.0, 4.0, 0.0]];
+        let l1 = Path::polyline(&P1).length_mm(a, b, 8.0);
+        let l2 = Path::polyline(&P2).length_mm(a, b, 8.0);
+        assert!(l2 > l1, "绕得更远必须更长：{l1} vs {l2}");
+        assert!(l2 > Path::Tortuous(1.2).length_mm(a, b, 8.0) - 1.0);
     }
 }
