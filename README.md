@@ -383,6 +383,50 @@ Two hard rules, both testable:
 
 ---
 
+## Real fibre paths, and delays without a delay array
+
+Two things the slot geometry cannot express on its own:
+
+**1. A connection is not a straight line.** `Path` says how the fibre actually runs:
+
+```rust
+Path::Straight                     // default
+Path::Tortuous(1.4)                // straight × tortuosity (axons are not straight; 1.2–1.6 typical)
+Path::Via([0.0, 12.0, 0.0])        // through a waypoint: corpus callosum over the midline, around a nucleus
+Path::Fixed(60.0)                  // measured fibre length in mm (geometry ignored)
+```
+
+Measured with two areas 8 mm apart (`dt = 0.5 ms`):
+
+```
+直 4 tick   迂曲(1.6) 5 tick   中转(上方 12mm) 8 tick   实测 60mm 14 tick
+```
+
+**2. Delays need not be stored.** Delay is a function of physical coordinates, so
+`Config::delay_mode` offers two strategies:
+
+| Mode | What is stored | Memory |
+|---|---|---|
+| `Stored` (default) | one `u8` per synapse | 1 byte / synapse |
+| `Derived` | nothing; recomputed from `(area-pair distance, both coords)` each step | **0 bytes** |
+
+```rust
+Config { delay_mode: DelayMode::Derived, ..Default::default() }
+brain.delay_bytes();   // 0   ← the whole delay array is gone
+```
+
+Measured (`derived_delay_matches_stored_bit_for_bit`): both modes produce **identical spike
+counts** over 300 steps (a bit-for-bit assertion — otherwise "saving memory" would just be
+changing the model), while the delay array drops from 384 B to 0 B on that small network.
+At the scale of the full brain (7×10⁷ synapses) that is ~70 MB.
+
+Two stated constraints: `Derived` assumes **straight** fibres (a projection declaring
+`Via/Tortuous/Fixed` falls back to storing its delays), and same-area synapses are a single
+synaptic delay in both modes.
+
+
+---
+
 ## Synapses are declarations too
 
 A projection says *where* (`Efferent`); a [`Synapse`] says *what kind of synapse*:

@@ -84,6 +84,7 @@ struct Wire {
     w: f32,
     fan_in: Option<usize>,
     synapse: crate::link::synapse::Synapse,
+    path: crate::link::projection::Path,
 }
 
 /// 组装：若干部件实例 + 它们之间的连线。
@@ -102,6 +103,14 @@ impl Assembly {
     /// 实例化一个部件。`instance` 是实例名前缀（展开后区名 = `实例:区`）。
     pub fn add(&mut self, module: &'static Module, instance: &'static str) -> &mut Self {
         self.insts.push((module, instance));
+        self
+    }
+
+    /// 给最后一条连线指定**纤维路径**（迂曲/中转/实测长度）。
+    pub fn with_path(&mut self, path: crate::link::projection::Path) -> &mut Self {
+        if let Some(w) = self.wires.last_mut() {
+            w.path = path;
+        }
         self
     }
 
@@ -128,6 +137,7 @@ impl Assembly {
             w,
             fan_in,
             synapse: crate::link::synapse::Synapse::FIXED,
+                path: crate::link::projection::Path::Straight,
         });
         self
     }
@@ -242,6 +252,7 @@ impl Assembly {
                 w: w.w,
                 fan_in: w.fan_in,
                 synapse: w.synapse,
+                path: w.path,
             };
             match extra.iter_mut().find(|(i, n, _)| *i == fi && *n == fport.area) {
                 Some((_, _, v)) => v.push(ef),

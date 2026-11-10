@@ -181,6 +181,45 @@ pub struct Edge {
     pub arbor: Arbor,
 }
 
+/// **轴突/树突的实际路径**：两点之间的连接不一定是直线。
+///
+/// 为什么需要它：传导延迟取决于**纤维长度**，不是"两个胞体之间的直线距离"。
+/// 真实轴突会绕（白质走向、经胼胝体过中线、绕过核团），树突也有长度。
+/// 只按直线算会系统性低估延迟。
+///
+/// 三种写法（按需要精度选）：
+/// * [`Path::Straight`]：直线（默认，最省）
+/// * [`Path::Tortuous`]：直线 × 迂曲度（轴突/树突的典型因子 1.2–1.6）
+/// * [`Path::Via`]：**经一个中转点**（如过中线、绕路）→ 长度 = |a→w| + |w→b|
+/// * [`Path::Fixed`]：直接给长度（实测值，绕过几何）
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Path {
+    /// 直线距离。
+    Straight,
+    /// 直线 × 迂曲度（>1）。生物上轴突不是直线；1.2–1.6 是常见量级。
+    Tortuous(f32),
+    /// 经中转点（毫米，MNI 坐标）：胼胝体过中线、绕过核团等。
+    Via([f32; 3]),
+    /// 固定长度（毫米）——已有实测纤维长度时用这个，几何被忽略。
+    Fixed(f32),
+}
+
+impl Path {
+    /// 由两端位置算**纤维长度（毫米）**，`euclid` 是直线距离。
+    pub fn length_mm(self, a: [f32; 3], b: [f32; 3], euclid: f32) -> f32 {
+        match self {
+            Path::Straight => euclid,
+            Path::Tortuous(k) => euclid * k.max(1.0),
+            Path::Via(w) => {
+                let d1 = ((a[0] - w[0]).powi(2) + (a[1] - w[1]).powi(2) + (a[2] - w[2]).powi(2)).sqrt();
+                let d2 = ((w[0] - b[0]).powi(2) + (w[1] - b[1]).powi(2) + (w[2] - b[2]).powi(2)).sqrt();
+                d1 + d2
+            }
+            Path::Fixed(mm) => mm.max(0.0),
+        }
+    }
+}
+
 /// 一条**出向投射声明**：属于某个区（`AreaSpec.efferents`）。
 ///
 /// 与 [`crate::link::validate::Link`] 的关系：`Link` 是装配层的"两边都写全"的写法
@@ -203,6 +242,8 @@ pub struct Efferent {
     pub fan_in: Option<usize>,
     /// **这条投射上的突触长什么样**：权重分布 + 可塑性规则（默认固定权重）。
     pub synapse: crate::link::synapse::Synapse,
+    /// **纤维怎么走**（直线 / 迂曲 / 中转点 / 实测长度）。默认直线。
+    pub path: Path,
 }
 
 impl Efferent {
@@ -224,6 +265,7 @@ impl Efferent {
             w,
             fan_in: Some(fan_in),
             synapse: crate::link::synapse::Synapse::FIXED,
+            path: Path::Straight,
         }
     }
 }

@@ -365,6 +365,7 @@ mod tests {
                 w: 1.0,
                 fan_in: Some(8),
                 synapse: crate::link::synapse::Synapse::FIXED,
+                path: crate::link::projection::Path::Straight,
             },
         ];
         // A 有三条坏声明；B 是合法靶；第二个 A 触发重名

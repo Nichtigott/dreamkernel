@@ -20,7 +20,26 @@ use crate::core::layer::Layer;
 use crate::core::cell::RateUnit;
 use crate::core::neuron::{Neuron, Params};
 use crate::core::topo::{Coord, Topo};
-use crate::link::projection::Projection;
+use crate::link::projection::{Path, Projection};
+
+/// 传导延迟的存储策略。
+///
+/// 延迟是**物理坐标的函数**，所以有两种存法：
+/// * [`DelayMode::Stored`]：建脑时算好，**逐突触存 1 字节**。快，但大网络里
+///   1 亿突触就是 100 MB。
+/// * [`DelayMode::Derived`]：**不存**，每步由"区对中心距离 + 两端坐标"现算。
+///   省掉每突触 1 字节（1 亿突触 ≈ 100 MB → 0），代价是每步多几次浮点运算。
+///
+/// 两条约束（写进判据）：
+/// 1. 两种模式必须**逐位一致**（`derived_and_stored_agree`）——否则"省内存"就是换模型。
+/// 2. `Derived` 只按**直线**算纤维长度；声明了 `Path::Via/Tortuous/Fixed` 的投射会被
+///    强制按 `Stored` 处理（否则路径声明会被静默忽略）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum DelayMode {
+    #[default]
+    Stored,
+    Derived,
+}
 
 /// 建脑配置（框架层的默认值刻意保守：小、快、可复现）。
 #[derive(Debug, Clone)]
@@ -41,6 +60,8 @@ pub struct Config {
     pub dt_ms: f32,
     /// 没有输入时每区的基础驱动电流。
     pub ext_base: f32,
+    /// **延迟怎么存**：逐突触存（默认）还是由物理坐标现算（省内存）。
+    pub delay_mode: DelayMode,
     /// **可塑性总开关**：默认关。即使某条投射声明了 STDP，也要这里打开才生效
     /// （否则"加一条声明"就会悄悄改掉所有已有模型的行为）。
     pub plasticity: bool,
@@ -57,6 +78,7 @@ impl Default for Config {
             seed: 1,
             dt_ms: 1.0,
             ext_base: 0.0,
+            delay_mode: DelayMode::Stored,
             plasticity: false,
         }
     }
@@ -140,6 +162,10 @@ pub struct Brain {
     pub i_bias: Vec<f32>,
     /// 每神经元的调质增益 `[DA, NE, ACh, 5-HT]`。
     pub mod_gain: Vec<[f32; 4]>,
+    /// 延迟存储策略。
+    pub delay_mode: DelayMode,
+    /// 区对之间的**直线距离（毫米）**，`base_mm[a * n_areas + b]`。`Derived` 模式靠它。
+    base_mm: Vec<f32>,
     /// 每条入边的可塑性规则（与 `incoming` 平行）。
     pub rule: Vec<Vec<crate::link::synapse::Plasticity>>,
     /// 每神经元的 **pre 迹**（STDP 用）。
@@ -200,6 +226,15 @@ impl Brain {
 
     fn skeleton(areas: Vec<Area>, cfg: Config) -> Self {
         let n_areas = areas.len();
+        // 区对之间的直线距离（Derived 模式靠它；Stored 模式留着做对照/诊断）
+        let mut base_mm = vec![0.0f32; n_areas * n_areas];
+        for i in 0..n_areas {
+            for j in 0..n_areas {
+                let (a, b) = (areas[i].pos, areas[j].pos);
+                base_mm[i * n_areas + j] =
+                    ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt();
+            }
+        }
         let mut counts = Vec::with_capacity(n_areas);
         for (i, a) in areas.iter().enumerate() {
             let (e, inh) = cfg
@@ -270,6 +305,7 @@ impl Brain {
             area_start,
             counts,
             edges: Vec::new(),
+            delay_mode: cfg.delay_mode,
             cfg,
             hist: vec![0u8; n],
             steps: 0,
@@ -279,6 +315,7 @@ impl Brain {
             rng,
             i_bias,
             mod_gain,
+            base_mm,
             rule: vec![Vec::new(); n],
             pre_trace: vec![0.0; n],
             post_trace: vec![0.0; n],
@@ -336,6 +373,7 @@ impl Brain {
                 sn.eff.w,
                 sn.eff.projection,
                 &sn.eff.synapse,
+                sn.eff.path,
             );
             let n_after: usize = self.incoming.iter().map(|v| v.len()).sum();
             self.edges.push(BuiltEdge {
@@ -361,6 +399,7 @@ impl Brain {
         w_mul: f32,
         _proj: Projection,
         syn_decl: &crate::link::synapse::Synapse,
+        ef_path: Path,
     ) {
         let (sa, sb) = (self.area_start[a], self.area_start[b]);
         let ea = self.counts[a].0;
@@ -393,20 +432,24 @@ impl Brain {
                 self.incoming[post].push((pre, w_mul * syn.sample(&mut srng)));
                 self.rule[post].push(syn.rule);
                 // 延迟：有米制的拓扑才把长度当距离（② 档坍缩，不产生延迟）
-                let d = self.delay_for(a, b, len);
-                self.delay[post].push(d);
+                if self.delay_mode != DelayMode::Derived || ef_path != Path::Straight {
+                    let d = self.delay_for(a, b, len, ef_path);
+                    self.delay[post].push(d);
+                }
             }
         } else {
             // 广播：每个靶收 fan_in 个（近似均匀）
             let mut rng = crate::num::math::Lcg::new(self.cfg.seed ^ (a as u64) << 32 ^ b as u64);
-            let d_br = self.delay_for(a, b, 0.0);
+            let d_br = self.delay_for(a, b, 0.0, ef_path);
             for &di in &d_sel {
                 let post = sb + di;
                 for _ in 0..fan_in.max(1) {
                     let si = s_sel[(rng.next_f32() * s_sel.len() as f32) as usize % s_sel.len()];
                     self.incoming[post].push((sa + si, w_mul * syn.sample(&mut srng)));
                     self.rule[post].push(syn.rule);
-                    self.delay[post].push(d_br);
+                    if self.delay_mode == DelayMode::Stored || ef_path != Path::Straight {
+                        self.delay[post].push(d_br);
+                    }
                 }
             }
         }
@@ -414,9 +457,15 @@ impl Brain {
 
     /// 传导延迟（步）。长度 = **区中心距离** + 区内位置差（只有 `Metric::Millimetres`
     /// 的区才算区内那一项；② 坍缩档的"相邻"不是毫米，不能凭空造出距离）。
-    fn delay_for(&self, a: usize, b: usize, len_norm: f32) -> u8 {
+    /// 纤维长度（毫米）：**直线/迂曲/中转/实测**由那条投射的 [`Path`] 决定。
+    fn fiber_mm(&self, a: usize, b: usize, len_norm: f32, path: Path) -> f32 {
         let (pa, pb) = (self.areas[a].pos, self.areas[b].pos);
-        let dc = ((pa[0] - pb[0]).powi(2) + (pa[1] - pb[1]).powi(2) + (pa[2] - pb[2]).powi(2)).sqrt();
+        let euclid = ((pa[0] - pb[0]).powi(2) + (pa[1] - pb[1]).powi(2) + (pa[2] - pb[2]).powi(2)).sqrt();
+        // `Fixed` 是**实测整段长度**：不再叠加区内位置差
+        if let Path::Fixed(mm) = path {
+            return mm.max(0.0);
+        }
+        let base = path.length_mm(pa, pb, euclid);
         // 区内位置差：**只要有一端是真实米制拓扑**就算——沿源图的展布本身是轴突长度。
         // 两端都坍缩/无结构时这一项为 0（"相邻"不是毫米，不许凭空造距离）。
         let (ta, tb) = (self.areas[a].topology, self.areas[b].topology);
@@ -430,9 +479,45 @@ impl Brain {
         } else {
             0.0
         };
-        let mm = dc + intra;
-        // 10 mm/ms = 10 m/s（与实现层默认一致）；1 ms 是突触传递本身
+        base + intra
+    }
+
+    /// 毫米 → tick：1 ms 是突触传递本身，10 mm/ms 是传导速度，再按 dt 量化。
+    fn ticks_from_mm(&self, mm: f32) -> u8 {
         ((1.0 + mm / 10.0) / self.cfg.dt_ms).round().clamp(1.0, 16.0) as u8
+    }
+
+    fn delay_for(&self, a: usize, b: usize, len_norm: f32, path: Path) -> u8 {
+        self.ticks_from_mm(self.fiber_mm(a, b, len_norm, path))
+    }
+
+    /// `Derived` 模式下现算延迟（不存）。与 `Stored` 必须逐位一致。
+    fn derived_ticks(&self, pre: usize, post: usize) -> u8 {
+        let (ai, bi) = (self.area_of[pre], self.area_of[post]);
+        // 同区（局部递归）就是一个突触延迟，与 `Stored` 模式下写死的 1 tick 对齐
+        if ai == bi {
+            return 1;
+        }
+        let base = self.base_mm[ai * self.areas.len() + bi];
+        let (ca, cb) = (self.coord_of[pre], self.coord_of[post]);
+        // 区内位置差：与 `fiber_mm` 同一套规则（只有米制侧才计入）
+        let (ta, tb) = (self.areas[ai].topology, self.areas[bi].topology);
+        let len_norm = match ta.dims().max(tb.dims()) {
+            0 => 0.0,
+            1 => (ca.u - cb.u).abs(),
+            _ => ((ca.u - cb.u).powi(2) + (ca.v - cb.v).powi(2)).sqrt(),
+        };
+        let intra = if ta.has_metric() || tb.has_metric() {
+            let half = if ta.has_metric() {
+                1.5 + 3.0 * self.areas[ai].width.max(0.1)
+            } else {
+                1.5 + 3.0 * self.areas[bi].width.max(0.1)
+            };
+            len_norm * 2.0 * half
+        } else {
+            0.0
+        };
+        self.ticks_from_mm(base + intra)
     }
 
     /// 局部（同区）E→E 连边：`local_frac` 比例的随机连接。
@@ -454,7 +539,9 @@ impl Brain {
                         continue;
                     }
                     self.incoming[post].push((pre, 1.0));
-                    self.delay[post].push(1);
+                    if self.delay_mode == DelayMode::Stored {
+                        self.delay[post].push(1);
+                    }
                     self.rule[post].push(crate::link::synapse::Plasticity::Frozen);
                 }
             }
@@ -471,7 +558,12 @@ impl Brain {
                 }
             }
         }
-        self.max_delay = self.delay.iter().flatten().copied().max().unwrap_or(1) as usize;
+        self.max_delay = if self.delay_mode == DelayMode::Derived {
+            // 不存延迟时按上界取（`ticks_from_mm` 的夹取上限 = 16）
+            16
+        } else {
+            self.delay.iter().flatten().copied().max().unwrap_or(1) as usize
+        };
         self.hist = vec![0u8; (self.max_delay + 1) * self.neurons.len().max(1)];
         self.steps = 0;
     }
@@ -497,7 +589,11 @@ impl Brain {
         for post in 0..n {
             let mut acc = 0.0f32;
             for (k, &(pre, w)) in self.incoming[post].iter().enumerate() {
-                let d = (self.delay[post][k] as usize).min(self.max_delay);
+                let d = if self.delay_mode == DelayMode::Derived && self.delay[post].is_empty() {
+                    self.derived_ticks(pre, post) as usize
+                } else {
+                    (self.delay[post][k] as usize).min(self.max_delay)
+                };
                 if d == 0 {
                     continue;
                 }
@@ -600,6 +696,16 @@ impl Brain {
         }
         let c: u32 = self.spike_count[s..e].iter().sum();
         c as f32 / (e - s) as f32 / self.steps as f32 / self.cfg.dt_ms * 1000.0
+    }
+
+    /// 延迟存储占用的字节数（`Derived` 模式为 0 —— 这就是省下的那部分）。
+    pub fn delay_bytes(&self) -> usize {
+        self.delay.iter().map(|v| v.capacity()).sum::<usize>() * std::mem::size_of::<u8>()
+    }
+
+    /// 突触总数（诊断/内存估算用）。
+    pub fn n_synapses(&self) -> usize {
+        self.incoming.iter().map(|v| v.len()).sum()
     }
 
     pub fn n_neurons(&self) -> usize {
@@ -1041,6 +1147,7 @@ mod synapse_tests {
                 w: 1.0,
                 fan_in: Some(8),
                 synapse,
+                path: Path::Straight,
             }]
             .into_boxed_slice(),
         );
@@ -1130,5 +1237,96 @@ mod synapse_tests {
         let all = ws(&a);
         let uniq: std::collections::BTreeSet<u32> = all.iter().copied().collect();
         assert!(uniq.len() > 20, "lognormal 抖动应当造出离散权重（只有 {} 种）", uniq.len());
+    }
+}
+
+#[cfg(test)]
+mod path_and_memory_tests {
+    use super::*;
+    use crate::core::area::{AreaClass, Layout, LocalMotif, Micro, Size, Slot, TopoDomain};
+    use crate::link::projection::{Efferent, Path, Projection};
+
+    static OUT: [Slot; 1] = [Slot::efferent("out", TopoDomain::Somatic)];
+    static IN: [Slot; 1] = [Slot::afferent("in", TopoDomain::Somatic)];
+
+    fn area(name: &'static str, slots: &'static [Slot], topo: Topo, pos: [f32; 3]) -> AreaSpec {
+        AreaSpec {
+            name,
+            class: AreaClass::Cortex,
+            topo: TopoDomain::Somatic,
+            micro: Micro::cortical(),
+            size: Size::new(16, 0, 1),
+            layout: Layout::mni(pos, 1.0),
+            motif: LocalMotif::cortical(),
+            slots,
+            topology: topo,
+            efferents: &[],
+            neuron: crate::core::cell::Spec::new(crate::core::cell::Model::Lif).with_bias(2.0),
+            type_specs: &[],
+        }
+    }
+
+    fn brain_with(path: Path, mode: DelayMode) -> Brain {
+        let eff: &'static [Efferent] = Box::leak(
+            vec![Efferent {
+                path,
+                ..Efferent::topo("B", "out", "in", Projection::Feedforward, 1.0, 8)
+            }]
+            .into_boxed_slice(),
+        );
+        let mut a = area("A", &OUT, Topo::LINE, [0.0, 0.0, 0.0]);
+        a.efferents = eff;
+        let b = area("B", &IN, Topo::LINE, [8.0, 0.0, 0.0]);
+        Brain::declare(
+            &[a, b],
+            Config { n_exc: 16, n_inh: 0, dt_ms: 0.5, seed: 2, delay_mode: mode, ..Default::default() },
+        )
+        .expect("声明应当合法")
+    }
+
+    fn max_delay_of(b: &Brain, area: usize) -> u8 {
+        let (s, e) = (b.area_start[area], b.area_start[area + 1]);
+        b.delay[s..e].iter().flatten().copied().max().unwrap_or(0)
+    }
+
+    /// **路径可以不是直线**：迂曲/中转都会让延迟变大。
+    #[test]
+    fn longer_path_means_longer_delay() {
+        let straight = brain_with(Path::Straight, DelayMode::Stored);
+        let tortuous = brain_with(Path::Tortuous(1.6), DelayMode::Stored);
+        let via = brain_with(Path::Via([0.0, 12.0, 0.0]), DelayMode::Stored);
+        let fixed = brain_with(Path::Fixed(60.0), DelayMode::Stored);
+        let d = |b: &Brain| max_delay_of(b, 1);
+        println!(
+            "[path] 直 {:?} 迂曲 {:?} 中转 {:?} 固定 {:?}",
+            d(&straight),
+            d(&tortuous),
+            d(&via),
+            d(&fixed)
+        );
+        assert!(d(&tortuous) > d(&straight), "迂曲 1.6 必须更慢");
+        assert!(d(&via) > d(&straight), "绕中转点（12mm 上方）必须更慢");
+        // Fixed(60mm) → (1 + 6)/0.5 = 14 tick
+        assert_eq!(d(&fixed), 14, "固定长度 60mm 在 dt=0.5 下应是 14 tick");
+    }
+
+    /// **省内存不许换模型**：Derived 与 Stored 的脉冲必须逐位一致。
+    #[test]
+    fn derived_delay_matches_stored_bit_for_bit() {
+        let run = |mode| {
+            let mut b = brain_with(Path::Straight, mode);
+            b.wire_local();
+            let ext = vec![5.0f32, 1.0];
+            for _ in 0..300 {
+                b.step(&ext, &Modulators::default());
+            }
+            (b.spike_count.clone(), b.delay_bytes())
+        };
+        let (a, bytes_stored) = run(DelayMode::Stored);
+        let (c, bytes_derived) = run(DelayMode::Derived);
+        assert_eq!(a, c, "两种模式必须逐位一致，否则省内存就是换模型");
+        assert!(bytes_stored > 0, "Stored 模式应当占延迟内存");
+        assert_eq!(bytes_derived, 0, "Derived 模式不存延迟");
+        println!("[mem] 延迟内存：Stored {bytes_stored} B → Derived {bytes_derived} B");
     }
 }
