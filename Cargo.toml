@@ -8,6 +8,8 @@ readme = "README.md"
 license = "MIT OR Apache-2.0"
 keywords = ["neuroscience", "topology", "connectome", "modeling", "validation"]
 categories = ["science", "simulation"]
+repository = "https://github.com/Nichtigott/dreamkernel"
+documentation = "https://docs.rs/dreamkernel"
 exclude = ["*.pdf", "*.html"]
 
 [dependencies]
