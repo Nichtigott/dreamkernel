@@ -1,0 +1,14 @@
+[package]
+name = "dreamkernel"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Declarative topology/link layer for brain-like models: area shapes, projection maps, construction-time validation"
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+keywords = ["neuroscience", "topology", "connectome", "modeling", "validation"]
+categories = ["science", "simulation"]
+exclude = ["*.pdf", "*.html"]
+
+[dependencies]
+# 框架层**零依赖**：只有几何/映射/校验，不拖张量与 GPU。
