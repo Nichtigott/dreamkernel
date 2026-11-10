@@ -3,4 +3,5 @@
 pub mod area;
 pub mod cell;
 pub mod layer;
+pub mod neuron;
 pub mod topo;

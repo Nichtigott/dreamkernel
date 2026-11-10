@@ -38,6 +38,45 @@ assert_eq!(col.metric, Metric::Collapsed); // 坍缩：不转毫米
 
 ---
 
+## 声明 → 一个能跑的脑
+
+框架自带**最小脉冲引擎**（`dreamkernel::sim`）：把 `AreaSpec` 列表变成网络并跑起来。
+
+```rust
+use dreamkernel::sim::{Brain, Config};
+
+let mut brain = Brain::declare(&[SRC, MID, OUT], Config::default())?; // 声明 → 脑
+brain.wire_local();                                                  // 同区局部递归
+let mut ext = vec![0.0; brain.areas.len()];
+ext[0] = 1.2;                                                        // 只驱动第一个区
+for _ in 0..300 { brain.step(&ext, 1.0); }
+println!("{} {} {}", brain.rate_hz(0), brain.rate_hz(1), brain.rate_hz(2));
+```
+
+跑一下附带的示例（三个区、两条由声明生成的投射）：
+
+```bash
+cargo run --example minimal
+```
+
+实测输出（`dt = 0.5 ms`）：
+
+```
+神经元 180 个，共 2 条投射：
+  SRC → MID（Feedforward）1152 条突触
+  MID → OUT（Feedforward）1152 条突触
+t=100ms  SRC   63.7 Hz   MID   48.0 Hz   OUT   48.0 Hz
+t=300ms  SRC   68.2 Hz   MID   60.6 Hz   OUT   64.7 Hz
+MID 的**跨区**入边延迟：4–5 tick（SRC 有米制：跨区 8mm + 区内位置差）
+OUT 的**跨区**入边延迟：4–4 tick（MID 是坍缩档：区内位置不计入距离，只剩跨区 8mm）
+```
+
+最后两行就是三档精度的用处：**同一个"8 mm 距离"，有米制的一侧会因区内位置产生 4–5 tick 的展布，
+坍缩的一侧只有 4 tick**——距离在哪儿坍缩，延迟就在哪儿不分层。
+
+引擎**刻意不做**：受体、世界接口、GPU、睡眠/重放、区特化的花活（LGN 的 ON/OFF 双图、上丘运动图）。
+它只保证"声明能长出网络"，让框架成为一个可验证的最小闭环。
+
 ## 设计原则
 
 1. **零依赖**：不拖张量、GPU、文件格式。它要在任何环境里都能编译。
