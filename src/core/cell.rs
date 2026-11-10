@@ -98,10 +98,19 @@ pub struct Spec {
     pub refr_steps: u8,
     /// 步长（ms）。
     pub dt: f32,
-    /// 输入增益（`Rate` 单元用；脉冲模型忽略）。
+    /// 输入增益（`Rate` 单元用；脉冲模型当作输入倍率）。
     pub gain: f32,
     /// `Rate` 单元的激活函数。
     pub act: Act,
+    /// **基础电流**（静息时的驱动）。把"这个神经元偏兴奋/偏抑制"变成可声明。
+    pub i_bias: f32,
+    /// **个体差异**：同一份模板组装出一群神经元时，`tau_m`/`tau_a` 的 lognormal 抖动
+    /// （0 = 完全同质）。这就是"一个 cell 组装很多神经元但各有不同"。
+    pub tau_spread: f32,
+    /// **调质增益**：`[多巴胺, 去甲肾上腺素, 乙酰胆碱, 5-羟色胺]` 对这个神经元的输入增益。
+    /// 0 = 不受该调质影响。按**细胞类型**不同是生物事实（DA 对 D1/D2 方向相反，
+    /// 这里只保留"强度不同的正向增益"这一最简模型）。
+    pub mod_gain: [f32; 4],
 }
 
 impl Spec {
@@ -119,6 +128,9 @@ impl Spec {
                 dt: 1.0,
                 gain: 1.0,
                 act: Act::Tanh,
+                i_bias: 0.0,
+                tau_spread: 0.0,
+                mod_gain: [0.0; 4],
             },
             Model::Lif => Self {
                 model,
@@ -131,6 +143,9 @@ impl Spec {
                 dt: 1.0,
                 gain: 1.0,
                 act: Act::Tanh,
+                i_bias: 0.0,
+                tau_spread: 0.0,
+                mod_gain: [0.0; 4],
             },
             Model::Rate => Self {
                 model,
@@ -145,6 +160,9 @@ impl Spec {
                 // 默认 ReLU：**静息 0 输入 → 0 发放**。用 tanh 会让静止态发 50%
                 // （tanh(0)=0 映射到 [0,1] 是 0.5），那不是"静息"。
                 act: Act::Relu,
+                i_bias: 0.0,
+                tau_spread: 0.0,
+                mod_gain: [0.0; 4],
             },
         }
     }
@@ -176,6 +194,21 @@ impl Spec {
     }
     pub const fn with_act(mut self, a: Act) -> Self {
         self.act = a;
+        self
+    }
+    /// 基础电流（静息驱动）。
+    pub const fn with_bias(mut self, v: f32) -> Self {
+        self.i_bias = v;
+        self
+    }
+    /// 个体差异（τ 的 lognormal 抖动，0 = 同质）。
+    pub const fn with_spread(mut self, v: f32) -> Self {
+        self.tau_spread = v;
+        self
+    }
+    /// 调质增益 `[DA, NE, ACh, 5-HT]`。
+    pub const fn with_mod_gain(mut self, g: [f32; 4]) -> Self {
+        self.mod_gain = g;
         self
     }
 }
@@ -219,5 +252,36 @@ impl RateUnit {
     pub fn reset(&mut self) {
         self.v = 0.0;
         self.y = 0.0;
+    }
+}
+
+/// **调质**（neuromodulators）：四个标量，各 `0..=1`。
+///
+/// 为什么是四个具名字段而不是一个 `modulator: f32`：多巴胺与乙酰胆碱对同一个神经元
+/// 的作用方向/强度可以完全不同，用一个标量就把它们混成"兴奋度"，那不是机制。
+///
+/// ⚠️ **简化**：这里只做"输入增益"这一种作用（每个神经元由 `Spec::mod_gain` 决定
+/// 受哪种调质影响、强度多少）。真实的 DA 有 D1/D2 双向、ACh 改的是抑制网络……
+/// 那需要按受体建，不在此层。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Modulators {
+    pub da: f32,
+    pub ne: f32,
+    pub ach: f32,
+    pub ht5: f32,
+}
+
+impl Default for Modulators {
+    fn default() -> Self {
+        Self { da: 0.0, ne: 0.0, ach: 0.0, ht5: 0.0 }
+    }
+}
+
+impl Modulators {
+    pub const fn new(da: f32, ne: f32, ach: f32, ht5: f32) -> Self {
+        Self { da, ne, ach, ht5 }
+    }
+    pub fn as_array(self) -> [f32; 4] {
+        [self.da, self.ne, self.ach, self.ht5]
     }
 }

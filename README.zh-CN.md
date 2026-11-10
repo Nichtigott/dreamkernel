@@ -90,6 +90,55 @@ const MID: AreaSpec = AreaSpec {
 
 ---
 
+## 一个 `Cell` 模板 → 一群"各有不同"的神经元
+
+"这个神经元是什么类型"，需要的每一个旋钮都是 `Spec` 的字段，所以**类型 = 一组参数**，
+不用改引擎：
+
+| 字段 | 含义 |
+|---|---|
+| `model` | `AdLif` / `Lif`（同一积分器，β=0）/ `Rate` |
+| `tau_m`, `tau_a` | 膜 / 适应时间常数（ms） |
+| `theta`, `beta`, `gamma` | 阈值、适应强度、适应对阈值的增益 |
+| `refr_steps`, `dt` | 不应期步数、步长 |
+| `i_bias` | 静息驱动（"这个神经元偏兴奋/偏抑制"） |
+| `tau_spread` | **个体差异**：一个模板组装一群神经元时 τ 的 lognormal 抖动 |
+| `mod_gain: [DA, NE, ACh, 5-HT]` | 各调质对这个神经元输入的增益 |
+| `gain`, `act` | 发放率单元的斜率 / 激活（默认 `Relu`：静息即沉默） |
+
+按类型的模板写在区声明里（`type_specs = [P, PV, SOM, VIP]`；空 = 四类都用 `neuron`）：
+
+```rust
+static PV_FAST: Spec = Spec::new(Model::Lif).with_tau_m(8.0).with_theta(0.6);
+// type_specs: &[P_SLOW, PV_FAST, SOM, VIP]   → 类型就是这四组参数
+```
+
+实测（`type_specs_make_types_by_parameter`）：同样输入下，PV 的单神经元脉冲数是锥体的
+**4.3 倍**（1000 脉冲 / 10 个 PV vs 368 / 16 个 P）。
+
+## 调质是有名字的，不是一个"兴奋度"标量
+
+```rust
+let mods = Modulators::new(/*多巴胺*/ 0.0, /*去甲肾上腺素*/ 0.0, /*乙酰胆碱*/ 0.0, /*5-羟色胺*/ 0.0);
+brain.step(&ext, &mods);
+```
+
+作用 = `Σ mods[k] · Spec::mod_gain[k]`，加在输入电流上。实测（`cargo run --example minimal`，
+SRC 声明了 `mod_gain=[0.8,0,0,0]`）：
+
+```
+DA=0.0  SRC  193.3 Hz   MID   83.0 Hz   OUT  326.2 Hz
+DA=0.5  SRC  273.0 Hz   MID  115.5 Hz   OUT  395.7 Hz
+DA=1.0  SRC  343.5 Hz   MID  141.7 Hz   OUT  433.8 Hz
+```
+
+`mod_gain = 0` 的群体在任意 DA 水平下**逐位不变**（有断言）。
+
+> **简化的地方直说**：真实多巴胺经 D1/D2 起反向作用，ACh 改的是抑制网络，不是"加电流"。
+> 这一层只建"每种调质 × 每种细胞类型的输入增益"；受体级细节属于具体的脑，不属于框架。
+
+---
+
 ## 组装：脑是"拼起来"的
 
 单个 `AreaSpec` 只是"一个区"。真实建模时你要的通常是**可复用的部件**——比如

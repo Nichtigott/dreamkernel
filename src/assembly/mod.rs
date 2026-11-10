@@ -296,6 +296,7 @@ fn split(end: &'static str) -> (&'static str, &'static str) {
 mod tests {
     use super::*;
     use crate::core::area::{AreaClass, Layout, LocalMotif, Micro, Size, Slot};
+    use crate::core::cell::Modulators;
     use crate::sim::{Brain, Config};
 
     static RELAY_SLOTS: [Slot; 2] = [
@@ -316,6 +317,7 @@ mod tests {
         topology: crate::core::topo::Topo::LINE,
         efferents: &NO_EFF,
         neuron: crate::core::cell::Spec::new(crate::core::cell::Model::AdLif),
+        type_specs: &[],
     };
 
     static RELAY_AREAS: [AreaSpec; 1] = [RELAY];
@@ -377,7 +379,7 @@ mod tests {
         let mut brain = Brain::declare(&specs, cfg).expect("组装出的声明应当合法");
         let ext = vec![8.0f32, 0.0];
         for _ in 0..200 {
-            brain.step(&ext, 1.0);
+            brain.step(&ext, &Modulators::default());
         }
         println!("[assembly] {} L {:.1} Hz  R {:.1} Hz", brain.edges.len(), brain.rate_hz(0), brain.rate_hz(1));
         assert!(brain.rate_hz(0) > 0.0, "被驱动的实例应当发放");

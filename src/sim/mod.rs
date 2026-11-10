@@ -15,7 +15,7 @@
 //! 层号由 `LaminarProfile` 的宽度比例分配——与实现层的约定一致，但不读那份数据。
 
 use crate::core::area::{Area, AreaSpec};
-use crate::core::cell::{CellType, Model, Spec};
+use crate::core::cell::{CellType, Model, Modulators, Spec};
 use crate::core::layer::Layer;
 use crate::core::cell::RateUnit;
 use crate::core::neuron::{Neuron, Params};
@@ -130,8 +130,12 @@ pub struct Brain {
     pub spike_count: Vec<u32>,
     /// 最近一步是否发放。
     pub spikes: Vec<bool>,
-    /// 运行时随机源（ 单元的概率发放用；同种子可复现）。
+    /// 运行时随机源（`Rate` 单元的概率发放用；同种子可复现）。
     rng: crate::num::math::Lcg,
+    /// 每神经元的基础电流（来自其细胞类型模板的 `Spec::i_bias`）。
+    pub i_bias: Vec<f32>,
+    /// 每神经元的调质增益 `[DA, NE, ACh, 5-HT]`。
+    pub mod_gain: Vec<[f32; 4]>,
 }
 
 impl Brain {
@@ -207,6 +211,8 @@ impl Brain {
         area_start.push(total);
 
         let mut rng = crate::num::math::Lcg::new(cfg.seed);
+        let mut i_bias = Vec::with_capacity(total);
+        let mut mod_gain: Vec<[f32; 4]> = Vec::with_capacity(total);
         let mut area_of = Vec::with_capacity(total);
         let mut cell_type = Vec::with_capacity(total);
         let mut layer_of = Vec::with_capacity(total);
@@ -220,15 +226,19 @@ impl Brain {
                 .iter()
                 .enumerate()
             {
+                // 该细胞类型的模板：`type_specs` 给了就用它，否则用区模板
+                let spec = a.type_specs.get(k).copied().unwrap_or(a.neuron);
                 let coords = topo.assign(n);
                 for (j, c) in coords.iter().enumerate() {
                     area_of.push(ai);
                     cell_type.push(t);
+                    i_bias.push(spec.i_bias);
+                    mod_gain.push(spec.mod_gain);
                     // 层：按区层构的宽度比例给（与实现层同一套：单层区统一 L3 槽位）
                     let frac = (j as f32 + 0.5) / n.max(1) as f32;
                     layer_of.push(layer_at(&present, &a.profile.width, frac));
                     coord_of.push(*c);
-                    neurons.push(cell_from(a.neuron, params_for(t, cfg.dt_ms)));
+                    neurons.push(cell_from(spec, params_for_spec(t, spec, &mut rng)));
                     let _ = k;
                 }
             }
@@ -255,6 +265,8 @@ impl Brain {
             spike_count: vec![0u32; n],
             spikes: vec![false; n],
             rng,
+            i_bias,
+            mod_gain,
         }
     }
 
@@ -432,11 +444,15 @@ impl Brain {
         self.steps = 0;
     }
 
-    /// 走一步。`ext` 是每区的额外驱动（长度不足按 0 补齐）。
+    /// 走一步。`ext` 是每区的额外驱动（长度不足按 0 补齐），`mods` 是**调质**水平。
+    ///
+    /// 调质怎么作用：每个神经元的 `Spec::mod_gain[k]` 决定它受第 k 种调质影响多少，
+    /// 效果是**加在输入电流上**（`Σ mods[k]·mod_gain[k]`）。这是简化模型——
+    /// 真实 DA 是 D1/D2 双向、ACh 改的是抑制网络（见 `Modulators` 的说明）。
     ///
     /// 延迟实现：`hist[d * n + i]` 表示"神经元 i 在 d 步前是否发放"，按 `steps % D` 取模
     /// 成环（`D = max_delay + 1`）。写在第 0 槽，读时按延迟回看 —— 这就是传导延迟。
-    pub fn step(&mut self, ext: &[f32], modulator: f32) {
+    pub fn step(&mut self, ext: &[f32], mods: &Modulators) {
         let n = self.neurons.len();
         if n == 0 {
             return;
@@ -459,7 +475,7 @@ impl Brain {
                     acc += w;
                 }
             }
-            syn[post] = acc * modulator;
+            syn[post] = acc;
         }
         // 2) 逐神经元积分
         let mut fired = vec![false; n];
@@ -468,7 +484,14 @@ impl Brain {
         for i in 0..n {
             let a = self.area_of[i];
             let e = ext.get(a).copied().unwrap_or(0.0) + self.cfg.ext_base;
-            let inp = syn[i] + self.input[i] + e;
+            // 调质：按该神经元的 `mod_gain` 把四种调质折算成输入电流
+            let mut mod_in = 0.0f32;
+            for (k, m) in mods.as_array().iter().enumerate() {
+                if *m != 0.0 {
+                    mod_in += *m * self.mod_gain[i][k];
+                }
+            }
+            let inp = syn[i] + self.input[i] + e + self.i_bias[i] + mod_in;
             fired[i] = self.neurons[i].step(inp, &mut self.rng);
             if fired[i] {
                 self.spike_count[i] += 1;
@@ -521,6 +544,36 @@ fn layer_at(present: &[Layer], width: &[f32; 6], frac: f32) -> u8 {
         }
     }
     *present.last().unwrap() as u8
+}
+
+/// 由**细胞模板**造参数：模板给什么就用什么，再叠加 `tau_spread` 的个体差异。
+///
+/// 这一步是"一个 cell 组装很多神经元但各有不同"的落点：同一种模板下，
+/// `tau_m`/`tau_a` 在 lognormal 上抖动（同种子可复现）。
+fn params_for_spec(t: CellType, spec: Spec, rng: &mut crate::num::math::Lcg) -> Params {
+    let mut p = params_for(t, spec.dt);
+    // 模板里显式给的字段覆盖默认值（"膜电位那些都可以设置"）
+    p.tau_m = spec.tau_m;
+    p.tau_a = spec.tau_a.max(spec.tau_m * 1.05);
+    p.theta = spec.theta;
+    p.beta = spec.beta;
+    p.gamma = spec.gamma;
+    p.refr_steps = spec.refr_steps;
+    p.dt = spec.dt;
+    if spec.model == Model::Lif {
+        p.beta = 0.0;
+        p.gamma = 0.0;
+    }
+    if spec.tau_spread > 0.0 {
+        // lognormal：乘性抖动，均值为 1
+        let u1 = rng.next_f32().max(1e-7);
+        let u2 = rng.next_f32();
+        let g = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos();
+        let f = (spec.tau_spread * g).exp();
+        p.tau_m *= f;
+        p.tau_a *= f;
+    }
+    p
 }
 
 /// 四类细胞的电生理参数（与实现层同一套默认；框架不装"区特化"）。
@@ -582,6 +635,7 @@ mod tests {
             topology: Topo::LINE,
             efferents: &SRC_EFF,
             neuron: crate::core::cell::Spec::default(),
+            type_specs: &[],
         }
     }
 
@@ -598,6 +652,7 @@ mod tests {
             topology: Topo::POINT,
             efferents: &[],
             neuron: crate::core::cell::Spec::default(),
+            type_specs: &[],
         }
     }
 
@@ -610,7 +665,7 @@ mod tests {
         for _ in 0..100 {
             let mut ext = vec![0.0; b.areas.len()];
             ext[0] = 8.0;
-            b.step(&ext, 1.0);
+            b.step(&ext, &Modulators::default());
         }
         let r_src = b.rate_hz(0);
         println!("[engine] SRC {r_src:.1} Hz  DST {:.1} Hz", b.rate_hz(1));
@@ -647,7 +702,7 @@ mod tests {
             for _ in 0..50 {
                 let mut ext = vec![0.0; b.areas.len()];
                 ext[0] = 8.0;
-                b.step(&ext, 1.0);
+                b.step(&ext, &Modulators::default());
             }
             b.spike_count.clone()
         };
@@ -677,6 +732,7 @@ mod cell_model_tests {
             topology: Topo::POINT,
             efferents: eff,
             neuron: spec,
+            type_specs: &[],
         }
     }
 
@@ -702,7 +758,7 @@ mod cell_model_tests {
         let mut ext = vec![0.0f32; 3];
         ext[0] = 6.0;
         for _ in 0..100 {
-            brain.step(&ext, 1.0);
+            brain.step(&ext, &Modulators::default());
         }
         assert!(brain.rate_hz(0) > 0.0, "被驱动的脉冲区应发放");
         assert_eq!(brain.rate_hz(2), 0.0, "0 输入时 Rate 单元必须静息（ReLU）");
@@ -717,10 +773,133 @@ mod cell_model_tests {
                 .unwrap();
             let ext = vec![4.0f32];
             for _ in 0..200 {
-                b.step(&ext, 1.0);
+                b.step(&ext, &Modulators::default());
             }
             b.spike_count.clone()
         };
         assert_eq!(run(), run(), "概率发放也必须由种子决定");
+    }
+}
+
+#[cfg(test)]
+mod modulator_tests {
+    use super::*;
+    use crate::core::area::{AreaClass, Layout, LocalMotif, Micro, Size, Slot, TopoDomain};
+    use crate::core::cell::{Model, Modulators, Spec};
+    use crate::link::projection::Efferent;
+
+    static SL: [Slot; 1] = [Slot::afferent("in", TopoDomain::None)];
+    static NO_EFF: [Efferent; 0] = [];
+
+    fn area(spec: Spec, types: &'static [Spec]) -> AreaSpec {
+        AreaSpec {
+            name: "A",
+            class: AreaClass::Cortex,
+            topo: TopoDomain::None,
+            micro: Micro::cortical(),
+            size: Size::new(16, 0, 1),
+            layout: Layout::mni([0.0, 0.0, 0.0], 0.5),
+            motif: LocalMotif::cortical(),
+            slots: &SL,
+            topology: Topo::POINT,
+            efferents: &NO_EFF,
+            neuron: spec,
+            type_specs: types,
+        }
+    }
+
+    fn run(mut b: Brain, da: f32, steps: usize) -> f32 {
+        let ext = vec![3.0f32];
+        for _ in 0..steps {
+            b.step(&ext, &Modulators::new(da, 0.0, 0.0, 0.0));
+        }
+        b.rate_hz(0)
+    }
+
+    /// **调质可设置且单调**：给一个"对 DA 敏感"的群体，DA 越高发放越高；
+    /// 对 DA 不敏感（`mod_gain=0`）的群体完全不受影响。
+    #[test]
+    fn dopamine_shifts_rate_only_where_declared() {
+        // 敏感：DA 增益 1.5
+        let sens = Spec::new(Model::Lif).with_bias(1.0).with_mod_gain([1.5, 0.0, 0.0, 0.0]);
+        let b0 = Brain::declare(&[area(sens, &[])], Config { n_exc: 32, n_inh: 0, seed: 2, ..Default::default() }).unwrap();
+        let b1 = Brain::declare(&[area(sens, &[])], Config { n_exc: 32, n_inh: 0, seed: 2, ..Default::default() }).unwrap();
+        let (r0, r1) = (run(b0, 0.0, 300), run(b1, 1.0, 300));
+        println!("[DA] 敏感群体：DA=0 → {r0:.1} Hz，DA=1 → {r1:.1} Hz");
+        assert!(r1 > r0 * 1.2, "对 DA 敏感的群体应当随 DA 升高发放：{r0} → {r1}");
+
+        // 不敏感：mod_gain = 0
+        let insens = Spec::new(Model::Lif).with_bias(1.0);
+        let c0 = Brain::declare(&[area(insens, &[])], Config { n_exc: 32, n_inh: 0, seed: 2, ..Default::default() }).unwrap();
+        let c1 = Brain::declare(&[area(insens, &[])], Config { n_exc: 32, n_inh: 0, seed: 2, ..Default::default() }).unwrap();
+        let (s0, s1) = (run(c0, 0.0, 300), run(c1, 1.0, 300));
+        assert_eq!(s0, s1, "没声明模质增益的群体不该受 DA 影响：{s0} vs {s1}");
+    }
+
+    /// **类型 = 参数集**：同一个区里，PV 模板比锥体模板快（τ_m 更小、阈值更低），
+    /// 于是 PV 的发放率显著高于锥体——不改引擎，只改声明。
+    #[test]
+    fn type_specs_make_types_by_parameter() {
+        let p = Spec::new(Model::Lif).with_tau_m(25.0).with_theta(1.2);
+        let pv = Spec::new(Model::Lif).with_tau_m(8.0).with_theta(0.6);
+        let som = p;
+        let vip = p;
+        // type_specs 的顺序 = [P, PV, SOM, VIP]
+        static TYPES: [Spec; 4] = [
+            Spec::new(Model::Lif), Spec::new(Model::Lif), Spec::new(Model::Lif), Spec::new(Model::Lif),
+        ];
+        // 静态切片不能在这里按运行期拼，所以直接用一个固定数组（值在下面用 with_* 不行）——
+        // 这里用 const 构造器拼出来
+        let types: &'static [Spec] = Box::leak(vec![p, pv, som, vip].into_boxed_slice());
+        let mut b = Brain::declare(
+            &[area(p, types)],
+            Config { n_exc: 16, n_inh: 16, seed: 4, ..Default::default() },
+        )
+        .unwrap();
+        let ext = vec![3.0f32];
+        for _ in 0..300 {
+            b.step(&ext, &Modulators::default());
+        }
+        // P 块与 PV 块的索引（counts = (E=16, PV=10, SOM=4, VIP=2)）
+        let (base, counts) = (b.area_start[0], b.counts[0]);
+        let e_block: u32 = b.spike_count[base..base + counts.0].iter().sum();
+        let pv_start = base + counts.0;
+        let pv_block: u32 = b.spike_count[pv_start..pv_start + counts.1].iter().sum();
+        println!("[types] P {e_block} 脉冲 / PV {pv_block} 脉冲（各 {} / {} 个神经元）", counts.0, counts.1);
+        assert!(pv_block > 0, "PV 群体应当发放");
+        // 归一化后比较（每神经元）：PV 的 τ 更小、阈值更低 ⇒ 单神经元发放更多
+        let per_p = e_block as f32 / counts.0 as f32;
+        let per_pv = pv_block as f32 / counts.1 as f32;
+        assert!(per_pv > per_p * 1.2, "PV 应当比锥体快得多：P={per_p:.1} PV={per_pv:.1}");
+        let _ = TYPES;
+    }
+
+    /// **个体差异**：`tau_spread > 0` 时同一模板组装出的一群神经元 τ 各不相同，
+    /// 但仍逐位可复现（同种子）。
+    #[test]
+    fn spread_makes_individual_differences_but_stays_reproducible() {
+        let spec = Spec::new(Model::AdLif).with_tau_m(20.0).with_spread(0.35);
+        let mk = || {
+            Brain::declare(
+                &[area(spec, &[])],
+                Config { n_exc: 64, n_inh: 0, seed: 9, ..Default::default() },
+            )
+            .unwrap()
+        };
+        let a = mk();
+        let b = mk();
+        let taus = |br: &Brain| -> Vec<u32> {
+            br.neurons
+                .iter()
+                .map(|c| match c {
+                    Cell::Spiking(n) => n.params.tau_m.to_bits(),
+                    Cell::Rate(_) => 0,
+                })
+                .collect()
+        };
+        let (ta, tb) = (taus(&a), taus(&b));
+        assert_eq!(ta, tb, "同种子必须逐位一致");
+        let uniq: std::collections::BTreeSet<u32> = ta.iter().copied().collect();
+        assert!(uniq.len() > 20, "tau_spread 应当造出个体差异（只有 {} 种 τ）", uniq.len());
     }
 }

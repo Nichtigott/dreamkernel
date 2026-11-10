@@ -94,6 +94,58 @@ for comparison, and therefore has to be declared explicitly.
 
 ---
 
+## One `Cell` template → a population with individual differences
+
+Every knob that matters for "what kind of neuron is this" is a field on `Spec`, so a
+**cell type is just a parameter set** — no engine change needed:
+
+| Field | Meaning |
+|---|---|
+| `model` | `AdLif` / `Lif` (same integrator, β=0) / `Rate` |
+| `tau_m`, `tau_a` | membrane / adaptation time constant (ms) |
+| `theta`, `beta`, `gamma` | threshold, adaptation strength, threshold gain from adaptation |
+| `refr_steps`, `dt` | refractory steps, timestep |
+| `i_bias` | resting drive ("this neuron leans excitable/inhibitory") |
+| `tau_spread` | **individual differences**: lognormal jitter of τ when one template builds a population |
+| `mod_gain: [DA, NE, ACh, 5-HT]` | how much each neuromodulator feeds this neuron's input |
+| `gain`, `act` | rate-unit slope / activation (`Relu` by default: silence at rest) |
+
+Per-type templates go in the area declaration (`type_specs = [P, PV, SOM, VIP]`;
+empty = the `neuron` template for all four):
+
+```rust
+static PV_FAST: Spec = Spec::new(Model::Lif).with_tau_m(8.0).with_theta(0.6);
+// type_specs: &[P_SLOW, PV_FAST, SOM, VIP]   → 类型就是这四组参数
+```
+
+Measured (`type_specs_make_types_by_parameter`): identical input, PV fires
+**4.3×** more spikes per neuron than pyramidal (1000 spikes / 10 PV vs 368 / 16 P).
+
+## Neuromodulators are named, not a single "arousal" scalar
+
+```rust
+let mods = Modulators::new(/*DA*/ 0.0, /*NE*/ 0.0, /*ACh*/ 0.0, /*5-HT*/ 0.0);
+brain.step(&ext, &mods);
+```
+
+Effect = `Σ mods[k] · Spec::mod_gain[k]` added to the input current. Measured
+(`cargo run --example minimal`, SRC declares `mod_gain=[0.8,0,0,0]`):
+
+```
+DA=0.0  SRC  193.3 Hz   MID   83.0 Hz   OUT  326.2 Hz
+DA=0.5  SRC  273.0 Hz   MID  115.5 Hz   OUT  395.7 Hz
+DA=1.0  SRC  343.5 Hz   MID  141.7 Hz   OUT  433.8 Hz
+```
+
+A population with `mod_gain = 0` is bit-identical under any DA level (asserted).
+
+> **Simplification, stated openly**: real dopamine acts through D1/D2 with opposite
+> signs, and ACh changes the inhibitory network rather than "adding current". This layer
+> only models *input gain per modulator per cell type*; receptor-level detail belongs to
+> the concrete brain, not the framework.
+
+---
+
 ## Assembly: a brain is put together from parts
 
 A single `AreaSpec` is *one area*. What you usually want is a **reusable part** — e.g.

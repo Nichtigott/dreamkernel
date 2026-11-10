@@ -130,8 +130,13 @@ pub struct Area {
     pub class: Option<AreaClass>,
     /// **显式声明**的拓扑域（同上）。
     pub topo: Option<TopoDomain>,
-    /// 该区的**神经元模型**（`Spec`：AdLif / Lif / Rate）。
+    /// 该区的**神经元模型模板**（`Spec`：AdLif / Lif / Rate）。
     pub neuron: crate::core::cell::Spec,
+    /// **按细胞类型**的模板（`[P, PV, SOM, VIP]`；空切片 = 四类都用 `neuron`）。
+    ///
+    /// 这就是"类型 = 参数集"：同一个区里的锥体与 PV 可以有不同的膜电位参数、
+    /// 不同的调质增益，而不需要改引擎。
+    pub type_specs: &'static [crate::core::cell::Spec],
     /// 该区**自己声明**的出向投射（由 `AreaSpec::to_area()` 填入）。
     /// 建脑时从这里**自动生成边**——这就是"声明即生成"。
     pub efferents: &'static [crate::link::projection::Efferent],
@@ -407,6 +412,11 @@ pub struct AreaSpec {
     /// 该区用哪种**神经元模型**（默认 AdLIF）。写进区声明，所以"这个区是脉冲的还是
     /// 发放率单元"是可声明的，而不是引擎里写死。
     pub neuron: crate::core::cell::Spec,
+    /// **按细胞类型**的模板（；空切片 = 四类都用 ）。
+    ///
+    /// 这就是"类型 = 参数集"：同一个区的锥体与 PV 可以有不同膜参数、不同调质增益，
+    /// 不需要改引擎。
+    pub type_specs: &'static [crate::core::cell::Spec],
 }
 
 impl AreaSpec {
@@ -422,6 +432,7 @@ impl AreaSpec {
             class: Some(self.class),
             topo: Some(self.topo),
             neuron: self.neuron,
+            type_specs: self.type_specs,
             efferents: self.efferents,
             slots: self.slots,
             topology: self.topology,

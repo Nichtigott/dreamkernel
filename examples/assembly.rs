@@ -12,7 +12,7 @@
 
 use dreamkernel::assembly::{Assembly, Module, Port};
 use dreamkernel::core::area::{AreaClass, AreaSpec, Layout, LocalMotif, Micro, Size, Slot, TopoDomain};
-use dreamkernel::core::cell::{Model, Spec};
+use dreamkernel::core::cell::{Model, Modulators, Spec};
 use dreamkernel::core::topo::{Map, Topo};
 use dreamkernel::link::projection::{Efferent, Projection};
 use dreamkernel::sim::{Brain, Config};
@@ -40,6 +40,7 @@ const RELAY: AreaSpec = AreaSpec {
     topology: Topo::LINE,
     efferents: &NO_EFF,
     neuron: Spec::new(Model::AdLif),
+    type_specs: &[],
 };
 
 static AREAS: [AreaSpec; 1] = [RELAY];
@@ -92,7 +93,7 @@ fn main() {
     }
     let ext = vec![SRC_DOSE, 0.0];
     for t in 0..300 {
-        brain.step(&ext, 1.0);
+        brain.step(&ext, &Modulators::default());
         if t % 100 == 99 {
             println!(
                 "t={:>3}ms  L {:>6.1} Hz   R {:>6.1} Hz",
