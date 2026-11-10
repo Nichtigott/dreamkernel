@@ -90,6 +90,38 @@ const MID: AreaSpec = AreaSpec {
 
 ---
 
+## 组装：脑是"拼起来"的
+
+单个 `AreaSpec` 只是"一个区"。真实建模时你要的通常是**可复用的部件**——比如
+「丘脑中继部件 = 中继核 + 局部中间神经元 + 一条组内投射」——把它实例化多次
+（左/右、V1/V2），再用**端口**连起来。
+
+```rust
+let mut asm = Assembly::new();
+asm.add(&RELAY_MOD, "L")
+   .add(&RELAY_MOD, "R")
+   .wire("L.out", "R.in", Projection::Feedforward, Map::Identity, 2.0, Some(12));
+
+let specs = asm.expand()?;          // 区名变成 "L:RELAY" / "R:RELAY"
+let mut brain = Brain::declare(&specs, Config::default())?;
+```
+
+```bash
+cargo run --example assembly
+# 组装：2 个实例、2 个区、1 条跨部件连线
+# 展开后 2 个区： L:RELAY（出向 1 条） / R:RELAY（出向 0 条）
+# L:RELAY → R:RELAY  288 条突触
+# t=300ms  L  291.6 Hz   R  229.3 Hz
+```
+
+两条硬规矩，都能变红：
+
+1. **部件内部的投射只能指向同部件的区**——跨部件必须走端口，否则实例化两次时
+   组内引用会指向另一个实例，静默接错。
+2. 实例名必须唯一；展开后的区名（`实例:区`）也必须唯一。
+
+---
+
 ## 别的框架是怎么做的
 
 粗略对比（按各项目的论文/文档；只作方向性参考）：

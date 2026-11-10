@@ -94,6 +94,39 @@ for comparison, and therefore has to be declared explicitly.
 
 ---
 
+## Assembly: a brain is put together from parts
+
+A single `AreaSpec` is *one area*. What you usually want is a **reusable part** — e.g.
+"thalamic relay = relay nucleus + local interneurons + one internal projection" —
+instantiated several times (left/right, V1/V2) and then wired through **ports**.
+
+```rust
+let mut asm = Assembly::new();
+asm.add(&RELAY_MOD, "L")
+   .add(&RELAY_MOD, "R")
+   .wire("L.out", "R.in", Projection::Feedforward, Map::Identity, 2.0, Some(12));
+
+let specs = asm.expand()?;          // names become "L:RELAY" / "R:RELAY"
+let mut brain = Brain::declare(&specs, Config::default())?;
+```
+
+```bash
+cargo run --example assembly
+# 组装：2 个实例、2 个区、1 条跨部件连线
+# 展开后 2 个区： L:RELAY（出向 1 条） / R:RELAY（出向 0 条）
+# L:RELAY → R:RELAY  288 条突触
+# t=300ms  L  291.6 Hz   R  229.3 Hz
+```
+
+Two hard rules, both testable:
+
+1. **A part's internal projections may only target areas of the same part.** Anything
+   crossing a part boundary must go through a `Port` — otherwise instantiating the part
+   twice silently points at the other instance.
+2. Instance names must be unique, and so must the expanded area names (`instance:area`).
+
+---
+
 ## How similar frameworks do it
 
 Rough comparison (from each project's papers/docs; orientation only):
