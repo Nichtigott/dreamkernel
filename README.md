@@ -383,6 +383,55 @@ Two hard rules, both testable:
 
 ---
 
+## Synapses are declarations too
+
+A projection says *where* (`Efferent`); a [`Synapse`] says *what kind of synapse*:
+
+```rust
+use dreamkernel::link::synapse::{Plasticity, Synapse, WeightDist};
+
+Synapse::FIXED                                  // default: fixed weight, no plasticity
+Synapse::noisy(2.0, 0.3)                        // lognormal jitter (relative sd 0.3)
+Synapse::stdp(2.0, 0.02, 0.021)                 // fixed mean + pair-based STDP
+Synapse::stdp(2.0, 0.02, 0.021)
+    .with_dist(WeightDist::Lognormal(0.3))      // both
+```
+
+**Two deliberate choices:**
+
+1. **Frozen by default.** Plasticity needs both a declaration *and* `Config::plasticity = true`,
+   so adding one declaration can never silently change an existing model.
+2. **Lognormal, not Gaussian.** Synaptic weights are positive and right-skewed; a Gaussian
+   would sample negative weights, which means *inhibitory* — a sign change, not noise.
+   (Measured eventually-mean of `Lognormal(0.3)` is `exp(σ²/2) ≈ 1.046`, not exactly 1.)
+
+STDP is the standard pair rule: `Δw = +a₊·x_pre` when the post fires, `Δw = −a₋·x_post` when
+the pre fires; traces decay by `exp(−dt/τ)`; weights are clamped to `[0, w_max]`.
+Measured (`stdp_potentiates_when_pre_leads`): mean incoming weight to the downstream area
+**1.0000 → 1.3006** over 300 steps when the pre side leads.
+
+## Blueprint tools: validate / describe / manifest / fingerprint
+
+Everything you need **without running dynamics** — usable in CI, before start-up, in review:
+
+```rust
+use dreamkernel::blueprint::Blueprint;
+
+let bp = Blueprint::new(&areas);
+let problems = bp.validate();     // ALL problems, not the first
+let summary  = bp.describe();     // human-readable: classes, three metric tiers, slots, synapses
+let json     = bp.manifest_json();// machine-readable (world / visualiser / external server)
+let (ah, eh) = bp.fingerprint();  // structure fingerprint
+```
+
+`validate` reports duplicate names, missing targets, missing/wrong-direction slots,
+sub-regions on shapeless areas, geometry mismatches (1-D target vs 2-D source), and
+non-topographic broadcast over a modality slot. `fingerprint` is order-sensitive: a
+representation-only refactor keeps it identical, any semantic change moves it.
+
+
+---
+
 ## How similar frameworks do it
 
 Rough comparison (from each project's papers/docs; orientation only):

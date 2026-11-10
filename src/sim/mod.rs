@@ -41,6 +41,9 @@ pub struct Config {
     pub dt_ms: f32,
     /// 没有输入时每区的基础驱动电流。
     pub ext_base: f32,
+    /// **可塑性总开关**：默认关。即使某条投射声明了 STDP，也要这里打开才生效
+    /// （否则"加一条声明"就会悄悄改掉所有已有模型的行为）。
+    pub plasticity: bool,
 }
 
 impl Default for Config {
@@ -54,6 +57,7 @@ impl Default for Config {
             seed: 1,
             dt_ms: 1.0,
             ext_base: 0.0,
+            plasticity: false,
         }
     }
 }
@@ -136,6 +140,14 @@ pub struct Brain {
     pub i_bias: Vec<f32>,
     /// 每神经元的调质增益 `[DA, NE, ACh, 5-HT]`。
     pub mod_gain: Vec<[f32; 4]>,
+    /// 每条入边的可塑性规则（与 `incoming` 平行）。
+    pub rule: Vec<Vec<crate::link::synapse::Plasticity>>,
+    /// 每神经元的 **pre 迹**（STDP 用）。
+    pre_trace: Vec<f32>,
+    /// 每神经元的 **post 迹**（STDP 用）。
+    post_trace: Vec<f32>,
+    /// 反查表：`outgoing[pre] = [(post, 第几条入边)]`，LTD 要按 pre 找下游。
+    outgoing: Vec<Vec<(usize, usize)>>,
 }
 
 impl Brain {
@@ -267,6 +279,10 @@ impl Brain {
             rng,
             i_bias,
             mod_gain,
+            rule: vec![Vec::new(); n],
+            pre_trace: vec![0.0; n],
+            post_trace: vec![0.0; n],
+            outgoing: Vec::new(),
         }
     }
 
@@ -319,6 +335,7 @@ impl Brain {
                 sn.eff.fan_in.unwrap_or(self.cfg.fan_in),
                 sn.eff.w,
                 sn.eff.projection,
+                &sn.eff.synapse,
             );
             let n_after: usize = self.incoming.iter().map(|v| v.len()).sum();
             self.edges.push(BuiltEdge {
@@ -343,6 +360,7 @@ impl Brain {
         fan_in: usize,
         w_mul: f32,
         _proj: Projection,
+        syn_decl: &crate::link::synapse::Synapse,
     ) {
         let (sa, sb) = (self.area_start[a], self.area_start[b]);
         let ea = self.counts[a].0;
@@ -361,8 +379,10 @@ impl Brain {
         if s_sel.is_empty() || d_sel.is_empty() {
             return;
         }
-        // 权重：源细胞类型决定符号（框架不猜生物量，用 1.0 作基准）
-        let w = 1.0 * w_mul;
+        // 权重：源细胞类型决定符号（框架不猜生物量，用 1.0 作基准）；
+        // 具体权重的**分布**与**可塑性规则**由这条投射的 `Synapse` 声明决定。
+        let syn = *syn_decl;
+        let mut srng = crate::num::math::Lcg::new(self.cfg.seed ^ 0xA5A5 ^ (a as u64) << 20 ^ b as u64);
         if map.is_topographic() && st.dims() > 0 && dt.dims() > 0 {
             // 按坐标配对（保序）：每个靶收最近的 fan_in 个源
             let sco: Vec<Coord> = s_sel.iter().map(|&i| cs[i]).collect();
@@ -370,7 +390,8 @@ impl Brain {
             for (di, si, len) in map.pair_with_len(&sco, &dco, fan_in) {
                 let post = sb + d_sel[di];
                 let pre = sa + s_sel[si];
-                self.incoming[post].push((pre, w));
+                self.incoming[post].push((pre, w_mul * syn.sample(&mut srng)));
+                self.rule[post].push(syn.rule);
                 // 延迟：有米制的拓扑才把长度当距离（② 档坍缩，不产生延迟）
                 let d = self.delay_for(a, b, len);
                 self.delay[post].push(d);
@@ -383,7 +404,8 @@ impl Brain {
                 let post = sb + di;
                 for _ in 0..fan_in.max(1) {
                     let si = s_sel[(rng.next_f32() * s_sel.len() as f32) as usize % s_sel.len()];
-                    self.incoming[post].push((sa + si, w));
+                    self.incoming[post].push((sa + si, w_mul * syn.sample(&mut srng)));
+                    self.rule[post].push(syn.rule);
                     self.delay[post].push(d_br);
                 }
             }
@@ -433,12 +455,22 @@ impl Brain {
                     }
                     self.incoming[post].push((pre, 1.0));
                     self.delay[post].push(1);
+                    self.rule[post].push(crate::link::synapse::Plasticity::Frozen);
                 }
             }
         }
     }
 
     fn finish(&mut self) {
+        // 反查表（LTD：pre 发放时按 post 迹削弱所有下游）
+        self.outgoing = vec![Vec::new(); self.neurons.len()];
+        for (post, list) in self.incoming.iter().enumerate() {
+            for (k, &(pre, _)) in list.iter().enumerate() {
+                if pre < self.outgoing.len() {
+                    self.outgoing[pre].push((post, k));
+                }
+            }
+        }
         self.max_delay = self.delay.iter().flatten().copied().max().unwrap_or(1) as usize;
         self.hist = vec![0u8; (self.max_delay + 1) * self.neurons.len().max(1)];
         self.steps = 0;
@@ -497,13 +529,67 @@ impl Brain {
                 self.spike_count[i] += 1;
             }
         }
-        // 3) 本步脉冲写进环
+        // 3) 可塑性：迹衰减 → LTP（post 发放）/ LTD（pre 发放）
+        if self.cfg.plasticity {
+            self.apply_plasticity(&fired);
+        }
+
+        // 4) 本步脉冲写进环
         self.steps += 1;
         let slot = self.steps % d_size;
         for (i, &f) in fired.iter().enumerate() {
             self.hist[slot * n + i] = u8::from(f);
         }
         self.spikes = fired;
+    }
+
+    /// 成对 STDP：`Δw = +a_plus·x_pre`（post 发放时）、`−a_minus·x_post`（pre 发放时）。
+    ///
+    /// 迹按 `1−dt/τ` 衰减（一阶），权重夹在 `[0, w_max]`。
+    #[allow(clippy::needless_range_loop)] // 同一轮里同时改三个数组，zip 会更乱
+    fn apply_plasticity(&mut self, fired: &[bool]) {
+        let n = self.neurons.len();
+        // 下标有语义：同一轮里要同时改 pre_trace/post_trace/incoming，zip 反而更乱
+        let dt = self.cfg.dt_ms;
+        // 先算衰減系数（按每条边自己的 τ，退化时用 20ms）
+        for i in 0..n {
+            self.pre_trace[i] *= (1.0 - dt / 20.0).clamp(0.0, 1.0);
+            self.post_trace[i] *= (1.0 - dt / 20.0).clamp(0.0, 1.0);
+            if fired[i] {
+                self.pre_trace[i] += 1.0;
+                self.post_trace[i] += 1.0;
+            }
+        }
+        // LTP / LTD
+        for post in 0..n {
+            if !fired[post] {
+                continue;
+            }
+            for k in 0..self.incoming[post].len() {
+                let crate::link::synapse::Plasticity::Stdp { a_plus, w_max, .. } = self.rule[post][k] else {
+                    continue;
+                };
+                let pre = self.incoming[post][k].0;
+                let w = self.incoming[post][k].1 + a_plus * self.pre_trace[pre];
+                self.incoming[post][k].1 = w.clamp(0.0, w_max);
+            }
+        }
+        for pre in 0..n {
+            if !fired[pre] {
+                continue;
+            }
+            // 借开：先把要改的 (post,k) 与 Δ 收集出来（避免同时借 incoming/outgoing）
+            let mut updates: Vec<(usize, usize, f32)> = Vec::new();
+            for &(post, k) in &self.outgoing[pre] {
+                if let crate::link::synapse::Plasticity::Stdp { a_minus, w_max, .. } = self.rule[post][k] {
+                    updates.push((post, k, -(a_minus * self.post_trace[post]).min(w_max)));
+                }
+            }
+            for (post, k, dw) in updates {
+                let w = (self.incoming[post][k].1 + dw).clamp(0.0, 1e9);
+                self.incoming[post][k].1 = w;
+            }
+        }
     }
 
     /// 某区的平均发放率（Hz，按已跑的步数折算）。
@@ -901,5 +987,148 @@ mod modulator_tests {
         assert_eq!(ta, tb, "同种子必须逐位一致");
         let uniq: std::collections::BTreeSet<u32> = ta.iter().copied().collect();
         assert!(uniq.len() > 20, "tau_spread 应当造出个体差异（只有 {} 种 τ）", uniq.len());
+    }
+}
+
+#[cfg(test)]
+mod synapse_tests {
+    use super::*;
+    use crate::core::area::{AreaClass, Layout, LocalMotif, Micro, Size, Slot, TopoDomain};
+    use crate::link::projection::{Efferent, Projection};
+    use crate::link::synapse::Synapse;
+
+    static IN: [Slot; 1] = [Slot::afferent("in", TopoDomain::None)];
+    static OUT: [Slot; 1] = [Slot::efferent("out", TopoDomain::None)];
+
+    // 用普通 const 拼两个区（efferents 需要 'static 切片）
+    static A_SRC: AreaSpec = AreaSpec {
+        name: "SRC",
+        class: AreaClass::Cortex,
+        topo: TopoDomain::None,
+        micro: Micro::cortical(),
+        size: Size::new(16, 0, 1),
+        layout: Layout::mni([0.0, 0.0, 0.0], 0.5),
+        motif: LocalMotif::cortical(),
+        slots: &OUT,
+        topology: Topo::POINT,
+        efferents: &[],
+        neuron: crate::core::cell::Spec::new(crate::core::cell::Model::Lif).with_bias(2.0),
+        type_specs: &[],
+    };
+    static A_DST: AreaSpec = AreaSpec {
+        name: "DST",
+        class: AreaClass::Cortex,
+        topo: TopoDomain::None,
+        micro: Micro::cortical(),
+        size: Size::new(16, 0, 1),
+        layout: Layout::mni([6.0, 0.0, 0.0], 0.5),
+        motif: LocalMotif::cortical(),
+        slots: &IN,
+        topology: Topo::POINT,
+        efferents: &[],
+        neuron: crate::core::cell::Spec::new(crate::core::cell::Model::Lif).with_bias(0.5),
+        type_specs: &[],
+    };
+
+    fn wire(synapse: Synapse, plastic: bool, seed: u64) -> Brain {
+        let eff: &'static [Efferent] = Box::leak(
+            vec![Efferent {
+                to: "DST",
+                from_slot: "out",
+                to_slot: "in",
+                projection: Projection::Feedforward,
+                map: crate::core::topo::Map::Identity,
+                w: 1.0,
+                fan_in: Some(8),
+                synapse,
+            }]
+            .into_boxed_slice(),
+        );
+        let mut src = A_SRC;
+        src.efferents = eff;
+        let mut b = Brain::declare(
+            &[src, A_DST],
+            Config { n_exc: 16, n_inh: 0, seed, plasticity: plastic, ..Default::default() },
+        )
+        .expect("声明应当合法");
+        b.wire_local();
+        b
+    }
+
+    fn mean_w(b: &Brain, area: usize) -> f32 {
+        let (s, e) = (b.area_start[area], b.area_start[area + 1]);
+        let mut sum = 0.0;
+        let mut n = 0;
+        for post in s..e {
+            for &(pre, w) in &b.incoming[post] {
+                if b.area_of[pre] != area {
+                    sum += w;
+                    n += 1;
+                }
+            }
+        }
+        if n == 0 { 0.0 } else { sum / n as f32 }
+    }
+
+    /// **默认冻结**：不声明可塑性、或全局开关关闭时，权重一步都不变。
+    #[test]
+    fn weights_are_frozen_unless_declared_and_enabled() {
+        let stdp = Synapse::stdp(1.0, 0.05, 0.05);
+        for plastic in [false, true] {
+            let mut b = wire(stdp, plastic, 4);
+            let before = mean_w(&b, 1);
+            let ext = vec![2.0f32, 0.0];
+            for _ in 0..200 {
+                b.step(&ext, &Modulators::default());
+            }
+            let after = mean_w(&b, 1);
+            if plastic {
+                assert!((after - before).abs() > 1e-6 || before == 0.0, "开了可塑性应当有权重变化");
+            } else {
+                assert_eq!(before, after, "全局开关关闭时权重必须逐位不变");
+            }
+        }
+    }
+
+    /// **STDP 方向正确**：pre 持续先于 post 发放 → 权重上升（LTP）。
+    #[test]
+    fn stdp_potentiates_when_pre_leads() {
+        let mut b = wire(Synapse::stdp(1.0, 0.05, 0.05), true, 7);
+        let before = mean_w(&b, 1);
+        // 只驱动上游：输入持续 → pre 先发，post 因延迟晚 1 步
+        let ext = vec![6.0f32, 1.0];
+        for _ in 0..300 {
+            b.step(&ext, &Modulators::default());
+        }
+        let after = mean_w(&b, 1);
+        println!("[stdp] DST 入边均值权重 {before:.4} → {after:.4}");
+        assert!(after > before, "pre 先于 post 应当增强权重：{before} → {after}");
+        // 权重必须被 w_max 夹住
+        let w_max = 4.0;
+        let (s, e) = (b.area_start[1], b.area_start[2]);
+        for post in s..e {
+            for &(_, w) in &b.incoming[post] {
+                assert!(w <= w_max + 1e-6, "权重越界 {w}");
+                assert!(w >= 0.0);
+            }
+        }
+    }
+
+    /// **权重分布**：lognormal 抖动造出离散度，但仍同种子逐位可复现。
+    #[test]
+    fn weight_distribution_is_reproducible_and_spread() {
+        let mk = |seed| wire(Synapse::noisy(1.0, 0.4), false, seed);
+        let a = mk(11);
+        let b = mk(11);
+        let ws = |br: &Brain| -> Vec<u32> {
+            let (s, e) = (br.area_start[1], br.area_start[2]);
+            let mut v: Vec<u32> = br.incoming[s..e].iter().flatten().map(|(_, w)| w.to_bits()).collect();
+            v.sort_unstable();
+            v
+        };
+        assert_eq!(ws(&a), ws(&b), "同种子必须一致");
+        let all = ws(&a);
+        let uniq: std::collections::BTreeSet<u32> = all.iter().copied().collect();
+        assert!(uniq.len() > 20, "lognormal 抖动应当造出离散权重（只有 {} 种）", uniq.len());
     }
 }

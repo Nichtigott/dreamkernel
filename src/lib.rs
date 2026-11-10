@@ -12,6 +12,7 @@
 //! 两层分工：本 crate 只出"机制"；具体是哪个脑（哪些区、哪条通路）由使用它的 crate 提供。
 
 pub mod assembly;
+pub mod blueprint;
 pub mod core;
 pub mod link;
 pub mod num;

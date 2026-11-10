@@ -373,6 +373,53 @@ cargo run --example assembly
 
 ---
 
+## 突触也是声明
+
+投射说"**从哪到哪**"（`Efferent`），`Synapse` 说"**这条投射上的突触长什么样**"：
+
+```rust
+use dreamkernel::link::synapse::{Plasticity, Synapse, WeightDist};
+
+Synapse::FIXED                                  // 默认：固定权重、无塑性
+Synapse::noisy(2.0, 0.3)                        // lognormal 抖动（相对离散度 0.3）
+Synapse::stdp(2.0, 0.02, 0.021)                 // 固定均值 + 成对 STDP
+Synapse::stdp(2.0, 0.02, 0.021)
+    .with_dist(WeightDist::Lognormal(0.3))      // 两者叠加
+```
+
+**两个刻意的选择：**
+
+1. **默认冻结**。可塑性要"声明 + `Config::plasticity = true`"**两把钥匙**，
+   所以"加一条声明"永远不会悄悄改掉已有模型的行为。
+2. **用 lognormal 而不是正态**。突触权重是正数、右偏；正态会抽到负权重——那是**抑制**，
+   是符号改变而不是噪声。（`Lognormal(0.3)` 的期望是 `exp(σ²/2) ≈ 1.046`，不是 1。）
+
+STDP 就是标准的成对规则：post 发放时 `Δw = +a₊·x_pre`，pre 发放时 `Δw = −a₋·x_post`，
+迹按 `exp(−dt/τ)` 衰减，权重夹在 `[0, w_max]`。
+实测（`stdp_potentiates_when_pre_leads`）：上游持续领先时，下游入边均值权重在 300 步内
+**1.0000 → 1.3006**。
+
+## 蓝图工具：validate / describe / manifest / fingerprint
+
+四个动作都**不跑动力学**——可以在 CI 里、启动前、评审时用：
+
+```rust
+use dreamkernel::blueprint::Blueprint;
+
+let bp = Blueprint::new(&areas);
+let problems = bp.validate();     // 返回**全部**问题，不是第一个
+let summary  = bp.describe();     // 人读：类别 / 三档拓扑 / 槽 / 突触
+let json     = bp.manifest_json();// 机读（世界 / 可视化 / 外部服务器）
+let (ah, eh) = bp.fingerprint();  // 结构指纹
+```
+
+`validate` 覆盖：区重名、缺靶区、缺槽、槽方向不符、无形状的区却声明子区域、
+几何拼不上（一维靶 vs 二维源）、有模态却广播。`fingerprint` 顺序敏感——
+**纯重构不变，语义改动一定变**。
+
+
+---
+
 ## 别的框架是怎么做的
 
 粗略对比（按各项目的论文/文档；只作方向性参考）：

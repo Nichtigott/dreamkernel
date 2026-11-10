@@ -201,6 +201,8 @@ pub struct Efferent {
     pub w: f32,
     /// 会聚数；`None` = 用槽声明的，再没有用默认 32。
     pub fan_in: Option<usize>,
+    /// **这条投射上的突触长什么样**：权重分布 + 可塑性规则（默认固定权重）。
+    pub synapse: crate::link::synapse::Synapse,
 }
 
 impl Efferent {
@@ -213,7 +215,16 @@ impl Efferent {
         w: f32,
         fan_in: usize,
     ) -> Self {
-        Self { to, from_slot, to_slot, projection, map: Map::Identity, w, fan_in: Some(fan_in) }
+        Self {
+            to,
+            from_slot,
+            to_slot,
+            projection,
+            map: Map::Identity,
+            w,
+            fan_in: Some(fan_in),
+            synapse: crate::link::synapse::Synapse::FIXED,
+        }
     }
 }
 

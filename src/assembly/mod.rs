@@ -83,6 +83,7 @@ struct Wire {
     map: Map,
     w: f32,
     fan_in: Option<usize>,
+    synapse: crate::link::synapse::Synapse,
 }
 
 /// 组装：若干部件实例 + 它们之间的连线。
@@ -119,7 +120,15 @@ impl Assembly {
         // 字符串先泄漏成 'static，供 `Wire` 存（组装期一次性）
         let f = leak(from);
         let t = leak(to);
-        self.wires.push(Wire { from: (0, f), to: (0, t), projection, map, w, fan_in });
+        self.wires.push(Wire {
+            from: (0, f),
+            to: (0, t),
+            projection,
+            map,
+            w,
+            fan_in,
+            synapse: crate::link::synapse::Synapse::FIXED,
+        });
         self
     }
 
@@ -232,6 +241,7 @@ impl Assembly {
                 map: w.map,
                 w: w.w,
                 fan_in: w.fan_in,
+                synapse: w.synapse,
             };
             match extra.iter_mut().find(|(i, n, _)| *i == fi && *n == fport.area) {
                 Some((_, _, v)) => v.push(ef),
